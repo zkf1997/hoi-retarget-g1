@@ -1,105 +1,104 @@
 # hand_bench — AnyTeleop vs TopoRetarget on HUMOTO / HiPHI (G1 + BrainCo Revo2 / G1 + Wuji Hand 2)
 
-
-> 2026-10-09 起本目录由 `humoto_bench` 改名为 `hand_bench`：它是手部重定向基准，HUMOTO 和 HiPHI 两个数据集共用同一套脚本（`BENCH_DATASET`），旧名字只反映了最先接入的数据集。
-把 HUMOTO（人-物交互，Mixamo 骨架含 21 点手部关键点 + 物体 6DoF 轨迹，30 fps）中的**手部动作**分别用
-**AnyTeleop**（`dex-retargeting` 的 vector 优化器，另跑 DexPilot 变体）和 **TopoRetarget**（`third_party/toporetarget`，
-Wu et al. 2026 的非官方实现）重定向到 G1 的两款灵巧手，输出统一指标并用 viser 并列播放。两种方法都是**手部**重定向：
-机器人手悬浮在人手腕位姿上（TopoRetarget 额外优化手基座位姿），躯干不重定向。
+> Since 2026-10-09 this directory is renamed from `humoto_bench` to `hand_bench`: it is the hand retargeting benchmark, and the HUMOTO and HiPHI datasets share the same scripts (`BENCH_DATASET`); the old name only reflected the first dataset that was integrated.
+Retargets the **hand motion** of HUMOTO (human-object interaction, Mixamo skeleton with 21 hand keypoints + object 6DoF trajectories, 30 fps) with
+**AnyTeleop** (the vector optimizer of `dex-retargeting`, plus a DexPilot variant) and **TopoRetarget** (`third_party/toporetarget`,
+an unofficial implementation of Wu et al. 2026) to the two dexterous hands of G1, outputs unified metrics and plays the results side by side in viser. Both methods are **hand** retargeting:
+the robot hand floats at the human wrist pose (TopoRetarget additionally optimizes the hand base pose); the torso is not retargeted.
 
 ```
 hand_bench/
-├── humoto_io.py          HUMOTO GLB 解析：Mixamo 65 关节 FK、每手 21 关键点（MediaPipe 顺序）、物体位姿、GLB 内嵌物体网格
-├── make_hand_urdfs.py    从 urdf/ 的两个 G1 URDF 切出手部子树 → urdf/g1_*/hand_{left,right}.urdf（根 = {side}_wrist_yaw_link）
-├── hand_model.py         MuJoCo 手模型：主动关节 / mimic、21 个机器人关键点、FK、关节限位、手尺寸
-├── prepare_humoto.py     序列筛选 + data/seqs/<seq>.npz + 手持物体网格与 CoACD 凸分解                     [handbench env]
-├── run_anyteleop.py      dex-retargeting（vector = AnyTeleop；--optimizer dexpilot）                          [handbench env]
-├── run_toporetarget.py   TopoRetarget 流水线（骨方向初始化 + 交互网格 Laplacian 优化）                          [handbench env]
-├── compare.py            指标 → results/metrics.csv, results/summary.md                                      [handbench env]
-├── viser_compare.py      viser 三车道：HUMOTO 人+物 | 方法 A 机器人手 | 方法 B 机器人手                        [handbench env]
-├── bench_common.py       共用 I/O（手坐标系、物体位姿、结果读写）
+├── humoto_io.py          HUMOTO GLB parsing: Mixamo 65-joint FK, 21 keypoints per hand (MediaPipe order), object poses, GLB-embedded object meshes
+├── make_hand_urdfs.py    cut the hand subtree out of the two G1 URDFs in urdf/ → urdf/g1_*/hand_{left,right}.urdf (root = {side}_wrist_yaw_link)
+├── hand_model.py         MuJoCo hand model: active joints / mimic, 21 robot keypoints, FK, joint limits, hand size
+├── prepare_humoto.py     sequence selection + data/seqs/<seq>.npz + handheld object meshes with CoACD convex decomposition      [handbench env]
+├── run_anyteleop.py      dex-retargeting (vector = AnyTeleop; --optimizer dexpilot)                                            [handbench env]
+├── run_toporetarget.py   TopoRetarget pipeline (bone-direction init + interaction-mesh Laplacian optimization)                 [handbench env]
+├── compare.py            metrics → results/metrics.csv, results/summary.md                                                   [handbench env]
+├── viser_compare.py      viser three lanes: HUMOTO human+objects | method A robot hands | method B robot hands                 [handbench env]
+├── bench_common.py       shared I/O (hand frame, object poses, result read/write)
 ├── data/     (git-ignored)  seqs/*.npz, objects/<obj>/{visual.obj, coacd_*.obj}, selection.json, handheld_objects.json
-└── results/  (git-ignored)  anyteleop/, anyteleop_dexpilot/, toporetarget/ 下 <hand>/<seq>__<side>.npz；metrics.csv；summary.md
+└── results/  (git-ignored)  anyteleop/, anyteleop_dexpilot/, toporetarget/ containing <hand>/<seq>__<side>.npz; metrics.csv; summary.md
 ```
 
-环境：`conda create -n handbench python=3.11 && pip install mujoco==3.3.5 dex-retargeting torch(cpu) trimesh viser coacd pyyaml pandas`
-（`dex-retargeting 0.5.0` 带 pinocchio/nlopt）。`third_party/toporetarget` 为 `git clone https://github.com/0iui0/toporetarget`（commit 8c7fbcb，git-ignored）。
+Environment: `conda create -n handbench python=3.11 && pip install mujoco==3.3.5 dex-retargeting torch(cpu) trimesh viser coacd pyyaml pandas`
+(`dex-retargeting 0.5.0` brings pinocchio/nlopt). `third_party/toporetarget` is `git clone https://github.com/0iui0/toporetarget` (commit 8c7fbcb, git-ignored).
 
-## 一键流程
+## One-shot workflow
 
 ```bash
 conda activate handbench; export MUJOCO_GL=disable
-python make_hand_urdfs.py                                  # 4 个 hand-only URDF
-python prepare_humoto.py --max-seqs 100 --per-object 3     # 102 段（每种手持物体最多 3 段，按接触帧比例排序），52 个物体，~11 min
+python make_hand_urdfs.py                                  # 4 hand-only URDFs
+python prepare_humoto.py --max-seqs 100 --per-object 3     # 102 sequences (at most 3 per handheld object, ranked by contact-frame fraction), 52 objects, ~11 min
 python run_anyteleop.py --hand brainco --workers 16;  python run_anyteleop.py --hand brainco --optimizer dexpilot --workers 16
 python run_anyteleop.py --hand wuji    --workers 16;  python run_anyteleop.py --hand wuji    --optimizer dexpilot --workers 16
-python run_toporetarget.py --hand brainco --workers 22;  python run_toporetarget.py --hand wuji --workers 22     # 各 ~10–25 min
+python run_toporetarget.py --hand brainco --workers 22;  python run_toporetarget.py --hand wuji --workers 22     # ~10–25 min each
 python compare.py --workers 16                             # → results/summary.md
 python viser_compare.py --hand brainco --methods anyteleop toporetarget      # http://localhost:8080
 ```
 
-## 数据（`humoto_io.py`, `prepare_humoto.py`）
+## Data (`humoto_io.py`, `prepare_humoto.py`)
 
-- HUMOTO 每段一个 GLB：`Armature`（scale 0.01，骨长单位 cm）下挂 Mixamo 骨架，手部 `Thumb1..4 / Index1..4 / …` 正好是
-  MediaPipe 21 点布局（0 腕 + 5 指 × 4）；每个物体是根节点，TRS 逐帧动画（米）。所有 735 段共用同一副骨架。
-  常量通道只有 2 个关键帧，按 30 fps 网格重采样。glTF Y-up → Z-up。
-- **物体网格用 GLB 内嵌的那份**（`humoto_objects_0805/*.obj` 与 GLB 节点坐标轴约定不一致，内嵌网格无歧义）。同一物体在各段中网格一致。
-- **手持物体**：包围盒最大边 ≤ 0.55 m（桌椅、货架、水槽等排除）。每手每帧记录最近手持物体及关键点到物体表面的最小距离。
-- 序列选择：含手持物体的序列按"任一手距物体 < 2 cm 的帧比例"排序，每种物体最多 3 段，共 102 段、32 597 帧、46 种物体实际被抓握。
-- 碰撞体：CoACD（threshold 0.05，≤ 16 块）；可视化用原网格。
+- HUMOTO has one GLB per sequence: a Mixamo skeleton under `Armature` (scale 0.01, bone lengths in cm); the hand bones `Thumb1..4 / Index1..4 / …` are exactly the
+  MediaPipe 21-point layout (0 wrist + 5 fingers × 4); each object is a root node with per-frame TRS animation (meters). All 735 sequences share the same skeleton.
+  Constant channels have only 2 keyframes; everything is resampled onto the 30 fps grid. glTF Y-up → Z-up.
+- **Object meshes come from the GLB-embedded copy** (`humoto_objects_0805/*.obj` and the GLB node axis conventions disagree; the embedded mesh is unambiguous). The mesh of a given object is identical across sequences.
+- **Handheld objects**: longest bounding-box edge ≤ 0.55 m (tables, chairs, shelves, sinks etc. are excluded). For each hand and frame, the nearest handheld object and the minimum keypoint-to-surface distance are recorded.
+- Sequence selection: sequences containing handheld objects are ranked by "fraction of frames in which either hand is < 2 cm from the object", at most 3 per object type, 102 sequences in total, 32 597 frames, 46 object types actually grasped.
+- Collision bodies: CoACD (threshold 0.05, ≤ 16 pieces); the original mesh is used for visualization.
 
-## 坐标约定
+## Coordinate conventions
 
-- **人手规范坐标系**（`humoto_io.hand_frame`）：原点腕关节；x = 腕→中指 MCP；z = 小指 MCP→食指 MCP（拇指侧，正交化）；y = z × x。
-  这与 `urdf/` 里两款手共用的 G1 腕约定一致：+x 远端、+z 拇指侧、掌心朝 +y（右手）/ −y（左手），所以人手关键点变换到该坐标系后可直接喂给机器人手。
-- **机器人 21 关键点**（`hand_model.py`）：0 = 法兰（BrainCo `*_base2_link` / Wuji `*_mount`，都在 x = 0.0415）；拇指 CMC/MCP/IP/TIP、
-  四指 MCP/PIP/DIP/TIP 取对应关节体原点与 `*_tip` 链接；BrainCo 手指没有 DIP 关节，DIP := 远节中点。
-- 法兰放在人腕关节上（腕→中指 MCP：人 9.3 cm，机器人法兰→MCP 10.3 cm）。**手尺寸比** = 机器人/人的中指链长（腕→MCP→PIP→DIP→指尖，与弯曲无关）：
-  BrainCo ≈ 1.00，Wuji ≈ 1.15。
-- **主动自由度**：BrainCo 每手 6（拇指 metacarpal + proximal，四指 proximal；5 个 distal 按 URDF `<mimic>` 联动，拇指 1.0×、四指 1.155×，与实机一致）；
-  Wuji 每手 20（全部）。
+- **Canonical hand frame of the human hand** (`humoto_io.hand_frame`): origin at the wrist joint; x = wrist → middle MCP; z = pinky MCP → index MCP (thumb side, orthogonalized); y = z × x.
+  This matches the G1 wrist convention shared by the two hands in `urdf/`: +x distal, +z thumb side, palm facing +y (right hand) / −y (left hand), so human keypoints transformed into this frame can be fed directly to the robot hand.
+- **Robot 21 keypoints** (`hand_model.py`): 0 = flange (BrainCo `*_base2_link` / Wuji `*_mount`, both at x = 0.0415); thumb CMC/MCP/IP/TIP and
+  four-finger MCP/PIP/DIP/TIP are taken from the corresponding joint body origins and the `*_tip` links; BrainCo fingers have no DIP joint, DIP := midpoint of the distal phalanx.
+- The flange is placed at the human wrist joint (wrist → middle MCP: human 9.3 cm, robot flange → MCP 10.3 cm). **Hand size ratio** = robot/human middle-finger chain length (wrist → MCP → PIP → DIP → tip, independent of curl):
+  BrainCo ≈ 1.00, Wuji ≈ 1.15.
+- **Active DoFs**: BrainCo 6 per hand (thumb metacarpal + proximal, four-finger proximal; the 5 distal joints follow via URDF `<mimic>`, thumb 1.0×, four fingers 1.155×, matching the real hardware);
+  Wuji 20 per hand (all).
 
-## 两种方法
+## The two methods
 
 | | AnyTeleop (`run_anyteleop.py`) | TopoRetarget (`run_toporetarget.py`) |
 |---|---|---|
-| 实现 | `dex-retargeting 0.5.0` `VectorOptimizer`（`--optimizer dexpilot` 为 `DexPilotOptimizer`） | `third_party/toporetarget`（非官方复现）`TopoRetargetPipeline` |
-| 输入 | 人手 5 个腕→指尖向量 × 尺寸比 | 人手 21 点（不缩放）+ 物体网格 + 物体位姿（都在人手规范坐标系） |
-| 目标 | Huber(机器人法兰→指尖向量 − 目标)，+ 对上一帧的正则；SLSQP，关节限位为约束；mimic 由 `MimicJointKinematicAdaptor` 处理 | 阶段 1：骨方向能量 + 时序平滑（L-BFGS-B）；阶段 2：交互网格 Laplacian 能量（Delaunay on 21 点 + 50 个物体表面采样）+ 骨方向 + 时序平滑 + 穿透软罚 |
-| 优化变量 | 主动关节 | 主动关节 + 手基座 6DoF（位置 + 四元数） |
-| 低通滤波 | 关（alpha=1），官方 teleop 配置为 0.2 | 无 |
-| 耗时 | ≈ 1–2 ms/帧 | ≈ 0.15–0.3 s/帧（单核，无并行争用时） |
+| Implementation | `dex-retargeting 0.5.0` `VectorOptimizer` (`--optimizer dexpilot` gives `DexPilotOptimizer`) | `third_party/toporetarget` (unofficial reproduction) `TopoRetargetPipeline` |
+| Input | 5 human wrist → fingertip vectors × size ratio | 21 human points (unscaled) + object mesh + object pose (all in the canonical hand frame) |
+| Objective | Huber(robot flange → fingertip vector − target), + regularization toward the previous frame; SLSQP, joint limits as constraints; mimic handled by `MimicJointKinematicAdaptor` | Stage 1: bone-direction energy + temporal smoothness (L-BFGS-B); stage 2: interaction-mesh Laplacian energy (Delaunay on 21 points + 50 object surface samples) + bone direction + temporal smoothness + soft penetration penalty |
+| Optimization variables | active joints | active joints + hand base 6DoF (position + quaternion) |
+| Low-pass filter | off (alpha=1); the official teleop config uses 0.2 | none |
+| Runtime | ≈ 1–2 ms/frame | ≈ 0.15–0.3 s/frame (single core, without parallel contention) |
 
-对上游 toporetarget 代码的改动（全部在 `run_toporetarget.py` 内以子类/猴子补丁方式实现，未改子模块）：
+Changes to the upstream toporetarget code (all implemented inside `run_toporetarget.py` as subclasses / monkey patches; the submodule is untouched):
 
-1. `RobotHand` 用 `hand_model.HandModel`（MuJoCo FK）实现，`base_pos` 即法兰（关键点 0）；
-2. 关节限位作为 L-BFGS-B 的 `bounds` 传入（上游调用 `scipy.optimize.minimize` 时**没有**限位）；
-3. `_estimate_joints_from_keypoints` 上游硬编码每指 3 关节（对 6 自由度的 BrainCo 会越界），改为张开手初值；
-4. `compute_laplacian` 换成数值等价的向量化版本（上游为 Python 双重循环，快 ~5×）。
+1. `RobotHand` is implemented with `hand_model.HandModel` (MuJoCo FK); `base_pos` is the flange (keypoint 0);
+2. joint limits are passed as `bounds` to L-BFGS-B (upstream calls `scipy.optimize.minimize` **without** limits);
+3. `_estimate_joints_from_keypoints` upstream hard-codes 3 joints per finger (out of range for the 6-DoF BrainCo); replaced by an open-hand initial value;
+4. `compute_laplacian` replaced by a numerically equivalent vectorized version (upstream is a Python double loop; ~5× faster).
 
-已知局限（属于该非官方实现）：穿透罚项只作用于"关键点—物体采样点距离 < 2 mm"，对手指**几何体**穿透没有约束；
-基座姿态从单位四元数出发、能量对整体旋转不敏感，常收敛到腕部大幅旋转的局部极小（见 `base_rot_deg`）；物体表面采样每帧随机（结果不完全可复现）。
+Known limitations (of this unofficial implementation): the penetration penalty only acts on "keypoint–object sample distance < 2 mm" and does not constrain finger **geometry** penetration;
+the base pose starts from the identity quaternion and the energy is insensitive to global rotation, so it often converges to local minima with large wrist rotation (see `base_rot_deg`); object surface samples are random per frame (results are not fully reproducible).
 
-## 指标（`compare.py`）
+## Metrics (`compare.py`)
 
-在"交互帧"（人手距物体 < 10 cm）上、把机器人手放在各方法自己的法兰位姿上计算：
+Computed on "interaction frames" (human hand < 10 cm from the object), with the robot hand placed at each method's own flange pose:
 
-| 指标 | 含义 |
+| Metric | Meaning |
 |---|---|
-| `pen_depth_mm` / `pen_frac` | 手部碰撞几何体与物体 CoACD 凸块的最深穿透（`mj_geomDistance`）均值 / 穿透 > 5 mm 的帧比例 |
-| `contact_recall` / `precision` / `f1` | 人指尖距物体表面 < 1.5 cm 记为接触；机器人指尖同阈值；逐指逐帧统计 |
-| `tip_obj_dist_err_mm` | \|机器人指尖-物体距离 − 人指尖-物体距离\| |
-| `tip_pos_err_mm` | 机器人指尖 vs 按尺寸比缩放的人指尖（手坐标系）；`pinch_err_mm` 拇-食指尖距误差；`inter_tip_err_mm` 10 对指尖距误差 |
-| `base_drift_mm` / `base_rot_deg` | 法兰相对人腕的平移 / 旋转（AnyTeleop 恒为 0） |
-| `q_vel_mrad` / `q_jerk_mrad` / `limit_sat` | 关节速度、二阶差分（mrad/帧）、处于限位的关节样本比例 |
-| `runtime_ms` | 每帧求解耗时（TopoRetarget 是 22 进程并行时测得，偏高） |
+| `pen_depth_mm` / `pen_frac` | mean deepest penetration between the hand collision geometry and the object CoACD convex pieces (`mj_geomDistance`) / fraction of frames with penetration > 5 mm |
+| `contact_recall` / `precision` / `f1` | a human fingertip < 1.5 cm from the object surface counts as contact; same threshold for robot fingertips; counted per finger per frame |
+| `tip_obj_dist_err_mm` | \|robot fingertip-object distance − human fingertip-object distance\| |
+| `tip_pos_err_mm` | robot fingertip vs human fingertip scaled by the size ratio (hand frame); `pinch_err_mm` thumb-index fingertip distance error; `inter_tip_err_mm` distance error over the 10 fingertip pairs |
+| `base_drift_mm` / `base_rot_deg` | flange translation / rotation relative to the human wrist (always 0 for AnyTeleop) |
+| `q_vel_mrad` / `q_jerk_mrad` / `limit_sat` | joint velocity, second difference (mrad/frame), fraction of joint samples at a limit |
+| `runtime_ms` | solve time per frame (TopoRetarget measured with 22 parallel processes, inflated) |
 
-## 结果
+## Results
 
-102 段（`data/selection.json`，每种手持物体 ≤ 3 段）× 左右手 = 204 个 (序列, 手) 样本，46 种物体；2026-09-25 跑完。
-完整表（含逐物体 contact_f1 / 穿透）见 `results/summary.md`，逐样本见 `results/metrics.csv`。
+102 sequences (`data/selection.json`, ≤ 3 per handheld object) × left/right hands = 204 (sequence, hand) samples, 46 object types; run completed 2026-09-25.
+Full table (including per-object contact_f1 / penetration) in `results/summary.md`; per-sample values in `results/metrics.csv`.
 
-**G1 + BrainCo Revo2（每手 6 主动自由度 + 5 mimic）**
+**G1 + BrainCo Revo2 (6 active DoFs + 5 mimic per hand)**
 
 | method | n | pen_depth_mm | pen_frac | contact_recall | contact_precision | contact_f1 | tip_obj_dist_err_mm | tip_pos_err_mm | pinch_err_mm | inter_tip_err_mm | base_drift_mm | base_rot_deg | q_vel_mrad | q_jerk_mrad | limit_sat | runtime_ms |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -107,7 +106,7 @@ python viser_compare.py --hand brainco --methods anyteleop toporetarget      # h
 | anyteleop_dexpilot | 204 | 9.380 | 0.715 | 0.815 | 0.873 | 0.821 | 6.573 | 17.4 | 14.6 | 9.529 | 0.000 | 0.000 | **3.177** | 1.967 | **0.058** | 1.744 |
 | toporetarget | 204 | 11.3 | 0.748 | 0.617 | 0.831 | 0.702 | 11.9 | 27.6 | 23.0 | 13.3 | 31.3 | 40.3 | 3.240 | **1.522** | 0.155 | 367.9 |
 
-**G1 + Wuji Hand 2（每手 20 自由度）**
+**G1 + Wuji Hand 2 (20 DoFs per hand)**
 
 | method | n | pen_depth_mm | pen_frac | contact_recall | contact_precision | contact_f1 | tip_obj_dist_err_mm | tip_pos_err_mm | pinch_err_mm | inter_tip_err_mm | base_drift_mm | base_rot_deg | q_vel_mrad | q_jerk_mrad | limit_sat | runtime_ms |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -115,36 +114,36 @@ python viser_compare.py --hand brainco --methods anyteleop toporetarget      # h
 | anyteleop_dexpilot | 204 | 6.647 | 0.493 | 0.633 | 0.921 | 0.729 | 8.164 | 2.422 | 5.697 | 2.841 | 0.000 | 0.000 | 3.427 | 2.247 | 0.027 | 2.957 |
 | toporetarget | 204 | 12.9 | 0.761 | 0.482 | 0.811 | 0.613 | 18.9 | 41.9 | 38.9 | 21.6 | 56.9 | 64.3 | **2.862** | **1.175** | 0.078 | 601.8 |
 
-读法：
-- **AnyTeleop（vector）在两款手上都是穿透最小、接触保持最好、指尖跟踪误差最小的方法**，且每帧 1–2 ms。DexPilot 变体与之接近，拇指投影先验在 Wuji 上略增加 pinch 误差。
-- Wuji 20 自由度能把缩放后的人指尖几乎精确复现（`tip_pos_err` 1 mm），但接触召回反而低于 BrainCo：Wuji 手比人手大 15%，法兰固定在人腕上时指尖按比例外移，离物体更远；BrainCo 尺寸比 ≈ 1，指尖落点与人一致。
-- 这里的 TopoRetarget 是**非官方复现**，结果弱于 AnyTeleop：基座 6DoF 自由度常收敛到腕部大幅旋转（平均 40°/64°、平移 3–6 cm）的局部极小，穿透罚项只约束关键点—采样点距离而非手指几何，交互网格的 Laplacian 项也不足以把手拉回物体表面。它唯一占优的是时序平滑（`q_jerk`）。因此这组数字反映的是该实现在 HUMOTO 上的表现，不能直接当作论文方法的上限。
-- 穿透均值 6–13 mm 对两种方法都偏大，主要来自大物体双手抱持（woven_basket、wash_tub、step_stool：人手指本身就贴着/陷入物体表面，HUMOTO 的手部数据与物体之间已有 ~1 cm 量级穿透），这是数据源限制。
+Reading:
+- **AnyTeleop (vector) has the lowest penetration, the best contact preservation and the lowest fingertip tracking error on both hands**, at 1–2 ms per frame. The DexPilot variant is close; its thumb projection prior slightly increases the pinch error on Wuji.
+- Wuji's 20 DoFs reproduce the scaled human fingertips almost exactly (`tip_pos_err` 1 mm), yet its contact recall is lower than BrainCo's: the Wuji hand is 15% larger than the human hand, and with the flange fixed at the human wrist the fingertips move outward proportionally, further from the object; BrainCo's size ratio is ≈ 1, so its fingertips land where the human's do.
+- TopoRetarget here is an **unofficial reproduction** and is weaker than AnyTeleop: the base 6DoF often converges to local minima with large wrist rotation (mean 40°/64°, translation 3–6 cm), the penetration penalty constrains only keypoint–sample distances rather than the finger geometry, and the interaction-mesh Laplacian term is not enough to pull the hand back to the object surface. Its only advantage is temporal smoothness (`q_jerk`). These numbers therefore reflect this implementation on HUMOTO and cannot be taken directly as the upper bound of the paper's method.
+- A mean penetration of 6–13 mm is high for both methods; it comes mainly from two-handed holding of large objects (woven_basket, wash_tub, step_stool: the human fingers themselves are flush with / sunk into the object surface; HUMOTO's hand data already has ~1 cm-scale penetration into the objects), which is a source-data limitation.
 
-## HiPHI（`BENCH_DATASET=hiphi`）
+## HiPHI (`BENCH_DATASET=hiphi`)
 
-同一套脚本也跑了 HiPHI 的 HOI 子集（`hiphi_io.py` + `prepare_hiphi.py`；`bench_common.py` 按环境变量 `BENCH_DATASET=hiphi`
-切到 `data_hiphi/`、`results_hiphi/`，`run_*.py` / `compare.py` / `viser_compare.py` 不变）：
+The same scripts also run on the HOI subset of HiPHI (`hiphi_io.py` + `prepare_hiphi.py`; `bench_common.py` switches to `data_hiphi/`, `results_hiphi/` via the environment variable `BENCH_DATASET=hiphi`;
+`run_*.py` / `compare.py` / `viser_compare.py` are unchanged):
 
 ```bash
 export BENCH_DATASET=hiphi MUJOCO_GL=disable
-python prepare_hiphi.py --per-category 5 --workers 20      # 7025 段 HOI 原始动作全部解析（~3 min），每类物体取接触帧比例最高的 5 段
-python run_anyteleop.py --hand brainco ...; python run_toporetarget.py --hand brainco ...   # 同上
+python prepare_hiphi.py --per-category 5 --workers 20      # parse all 7025 HOI raw motions (~3 min), take the 5 sequences with the highest contact-frame fraction per object category
+python run_anyteleop.py --hand brainco ...; python run_toporetarget.py --hand brainco ...   # as above
 python compare.py --workers 20; python viser_compare.py --hand brainco
 ```
 
-- 数据：`/home/kaizhao/projects/HiPHI/data/<frame>/<lu>/<motion_id>/`，55 关节 BVH（Y-up，cm，90 Hz，ZXY 欧拉；位置通道即局部平移），
-  手指每指 3 关节 + End Site 指尖 → 直接得到 MediaPipe 21 点；`object_tracks/<obj>.csv`（米，XYZW）+ `object_meshes/<mesh_id>.obj`（cm）。
-  只用非镜像的原始动作；90 Hz 按 3 抽帧到 30 Hz。7 段骨架缺 `Spine2` 的动作被跳过。
-- 物体是家具/容器尺度（球 24 cm、箱子 30–70 cm、桌椅 50–90 cm、瓶子 34 cm、拖把 137 cm），每段恰好一个，全部作为交互物体；
-  BVH 关键点在手内部，接触阈值用 3 cm 排序。选中 60 段、109788 帧（30 Hz）、13 个物体网格；
-  类别分布 {'ball': 5, 'bench': 5, 'bottle': 5, 'box': 5, 'bucket': 5, 'chair': 5, 'clothrack': 5, 'mop': 5, 'soccerball': 5, 'stepstool': 5, 'table': 5, 'trashbin': 5}；接触帧比例中位数 0.93。
-- 手尺寸比（中指链长）：BrainCo ≈ 1.00–1.05，Wuji ≈ 1.15–1.21（HiPHI 演员手比 HUMOTO 角色略小）。
+- Data: `/home/kaizhao/projects/HiPHI/data/<frame>/<lu>/<motion_id>/`, 55-joint BVH (Y-up, cm, 90 Hz, ZXY Euler; the position channels are the local translations),
+  3 joints per finger + End Site fingertip → MediaPipe 21 points directly; `object_tracks/<obj>.csv` (meters, XYZW) + `object_meshes/<mesh_id>.obj` (cm).
+  Only non-mirrored raw motions are used; 90 Hz is decimated by 3 to 30 Hz. 7 motions whose skeleton lacks `Spine2` are skipped.
+- Objects are furniture / container scale (ball 24 cm, boxes 30–70 cm, tables and chairs 50–90 cm, bottle 34 cm, mop 137 cm), exactly one per sequence, all treated as interaction objects;
+  the BVH keypoints lie inside the hand, so a 3 cm contact threshold is used for ranking. 60 sequences selected, 109788 frames (30 Hz), 13 object meshes;
+  category distribution {'ball': 5, 'bench': 5, 'bottle': 5, 'box': 5, 'bucket': 5, 'chair': 5, 'clothrack': 5, 'mop': 5, 'soccerball': 5, 'stepstool': 5, 'table': 5, 'trashbin': 5}; median contact-frame fraction 0.93.
+- Hand size ratio (middle-finger chain length): BrainCo ≈ 1.00–1.05, Wuji ≈ 1.15–1.21 (the HiPHI actors' hands are slightly smaller than the HUMOTO character's).
 
-### HiPHI 结果
+### HiPHI results
 
-60 段（12 类物体各 5 段）× 左右手 = 120 个样本，13 个物体网格，平均每段 1830 帧（30 Hz），交互帧占 86%，人指尖处于接触状态的比例 50%。
-完整表见 `results_hiphi/summary.md`，逐样本见 `results_hiphi/metrics.csv`。
+60 sequences (5 for each of 12 object categories) × left/right hands = 120 samples, 13 object meshes, 1830 frames per sequence on average (30 Hz), interaction frames 86%, human fingertips in contact 50% of the time.
+Full table in `results_hiphi/summary.md`, per-sample values in `results_hiphi/metrics.csv`.
 
 **G1 + BrainCo Revo2**
 
@@ -162,18 +161,18 @@ python compare.py --workers 20; python viser_compare.py --hand brainco
 | anyteleop_dexpilot | 120 | **23.4** | 0.924 | 0.725 | 0.799 | 0.732 | 7.270 | 3.717 | 4.750 | 3.360 | 0.000 | 0.000 | 6.856 | 6.008 | 0.034 | 2.362 |
 | toporetarget | 120 | 24.2 | **0.883** | 0.564 | 0.718 | 0.610 | 12.6 | 34.9 | 26.3 | 19.4 | 51.3 | 51.0 | **5.798** | **2.858** | 0.042 | 532.5 |
 
-读法：
-- 结论与 HUMOTO 一致：**AnyTeleop（vector）接触保持最好（F1 0.69 / 0.74）、指尖-物体距离误差最小、指尖跟踪最准、最快**；DexPilot 变体几乎相同。
-  TopoRetarget 仅在时序平滑上占优，接触 F1 低 0.1–0.13，基座依旧漂到 5 cm / 50° 量级，BrainCo 上 34% 的关节样本顶在限位。
-- 穿透整体比 HUMOTO 大一倍以上（18–24 mm vs 6–13 mm），且三种方法接近：HiPHI 的物体是家具/容器尺度，人手是整掌贴着箱子、椅背、台阶推拉抱举，
-  BVH 手部关键点在手掌内部、物体网格又是粗糙的扫描/建模件，源数据本身手掌与物体就有 1–3 cm 重叠；手部重定向无法修正这一点。
-  对 HiPHI 更有区分度的指标是接触保持与指尖-物体距离误差，而不是穿透深度。
-- 逐物体：球类、台阶凳、垃圾桶上 AnyTeleop 的接触 F1 0.8–0.9；晾衣架（细杆）和拖把（细柄）对所有方法都难（F1 0.3–0.5），
-  因为 BrainCo 6 自由度、Wuji 指节较粗，难以复现人手握细杆的闭合程度。TopoRetarget 在 Box_A_1 / Table_A_1 / StepStool（大平面）上与 AnyTeleop 持平或略好，
-  在球类上明显更差（F1 0.5 vs 0.8–0.9、穿透 33–38 mm）。
-- Wuji 的指尖跟踪误差只有 2.8 mm（20 自由度能精确复现缩放后的人手），但穿透反而比 BrainCo 大 5 mm：手大 15–20%，法兰固定在人腕上时整只手更深地插进物体。
+Reading:
+- The conclusions match HUMOTO: **AnyTeleop (vector) has the best contact preservation (F1 0.69 / 0.74), the lowest fingertip-object distance error, the most accurate fingertip tracking and is the fastest**; the DexPilot variant is nearly identical.
+  TopoRetarget wins only on temporal smoothness; its contact F1 is lower by 0.1–0.13, the base still drifts by 5 cm / 50°, and on BrainCo 34% of the joint samples sit at a limit.
+- Penetration is more than twice that of HUMOTO (18–24 mm vs 6–13 mm) and similar across the three methods: HiPHI objects are furniture / container scale, the human pushes, pulls, hugs and lifts boxes, chair backs and steps with the whole palm,
+  the BVH hand keypoints lie inside the palm and the object meshes are coarse scans / models, so the source data itself has a 1–3 cm overlap between palm and object; hand retargeting cannot correct this.
+  For HiPHI the more discriminative metrics are contact preservation and fingertip-object distance error, not penetration depth.
+- Per object: AnyTeleop reaches contact F1 0.8–0.9 on balls, the step stool and the trash bin; the clothes rack (thin bar) and the mop (thin handle) are hard for all methods (F1 0.3–0.5),
+  because BrainCo has 6 DoFs and Wuji's phalanges are thick, making the closure of a human hand around a thin bar hard to reproduce. TopoRetarget matches or slightly beats AnyTeleop on Box_A_1 / Table_A_1 / StepStool (large flat surfaces)
+  and is clearly worse on balls (F1 0.5 vs 0.8–0.9, penetration 33–38 mm).
+- Wuji's fingertip tracking error is only 2.8 mm (20 DoFs reproduce the scaled human hand exactly), but its penetration is 5 mm larger than BrainCo's: the hand is 15–20% larger, and with the flange fixed at the human wrist the whole hand sinks deeper into the object.
 
-## viser（`viser_compare.py`）
+## viser (`viser_compare.py`)
 
-三条车道沿 +y 排开：HUMOTO 人体骨架（黑）+ 手部关键点（红）+ 全部物体 | 方法 A 的两只机器人手 + 物体 | 方法 B。
-GUI：序列、机器人手（brainco/wuji）、播放/暂停、速度、帧、车道间距、车道显隐。远程用 `ssh -L 8080:localhost:8080`。
+Three lanes laid out along +y: HUMOTO human skeleton (black) + hand keypoints (red) + all objects | method A's two robot hands + objects | method B.
+GUI: sequence, robot hand (brainco/wuji), play/pause, speed, frame, lane spacing, lane visibility. For remote use: `ssh -L 8080:localhost:8080`.

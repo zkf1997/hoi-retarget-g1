@@ -14,11 +14,10 @@ environments, how to reproduce, viewers, result-archive format, pitfalls, open i
 |---|---|
 | [`omomo_bench/HANDOVER.md`](omomo_bench/HANDOVER.md) | entry point |
 | [`omomo_bench/RELEASE_FORMAT.md`](omomo_bench/RELEASE_FORMAT.md) | format of the result archive (`retarget_final_results_<date>.tar.gz`, distributed separately: source data, object meshes, final robot motions for 602 / 100 / 60 sequences) |
-| [`omomo_bench/README_EN.md`](omomo_bench/README_EN.md) | stage-by-stage details and every ablation |
+| [`omomo_bench/README.md`](`omomo_bench/README.md`) | stage-by-stage details and every ablation |
 | [`omomo_bench/reports/`](omomo_bench/reports) | analysis reports: UMR vs OmniRetarget on three datasets, finger-collision study, pushed-off sequences, white-chair defect; figures |
-| [`hand_bench/README_EN.md`](hand_bench/README_EN.md) | finger retargeting bench (AnyTeleop vs TopoRetarget) |
+| [`hand_bench/README.md`](hand_bench/README.md) | finger retargeting bench (AnyTeleop vs TopoRetarget) |
 | [`THIRD_PARTY.md`](THIRD_PARTY.md) | provenance of the robot models and the submodules |
-| `README_ZH.md`, `omomo_bench/README.md`, `hand_bench/README.md`, `omomo_bench/reports/*.md` without `_en` | Chinese originals |
 
 Final pipeline in one picture:
 

@@ -1,9 +1,9 @@
 # Handover: whole-body human-object-interaction retargeting to G1 + Wuji Hand 2
 
 Branch `handover-2026-10` of github.com/zkf1997/retarget (2026-10-20). Everything below lives in `omomo_bench/` unless
-stated otherwise. This document is the entry point; `README_EN.md` (translation of the Chinese `README.md`) has the
+stated otherwise. This document is the entry point; `README.md`  has the
 stage-by-stage details and the full ablation history; `RELEASE_FORMAT.md` the result archive format; `reports/` the
-analysis reports (`*_en.md` are translations of the Chinese ones); `hand_bench/README_EN.md` the finger-retargeting bench.
+analysis reports; `hand_bench/README.md` the finger-retargeting bench.
 
 ## 0. Quick start
 
@@ -24,13 +24,13 @@ Self-check of the whole setup (paths, data, final lanes, npz + MJCF, viewer, off
 
 | question | where |
 |---|---|
-| what each stage does, with equations | `README_EN.md` section 2 (2.1 body, 2.2 fingers, 2.3 coupled refinement); `README.md` is the Chinese original |
-| why UMR and not OmniRetarget as body stage | `reports/umr_vs_omni_3ds.md`, `reports/body_stage_comparison_2026-10-17_en.md` sections 2, 7 |
+| what each stage does, with equations | `README.md` section 2 (2.1 body, 2.2 fingers, 2.3 coupled refinement) |
+| why UMR and not OmniRetarget as body stage | `reports/umr_vs_omni_3ds.md`, `reports/body_stage_comparison_2026-10-17.md` sections 2, 7 |
 | why finger collision is off in the body stage | `reports/umr_finger_collision_3ds.md`, `body_stage_comparison` sections 4–6 |
 | why CoACD pieces and not the convex hull for OmniRetarget | `body_stage_comparison` section 3, README 6.9 |
-| the "hand on the far side of the chair" defect | `reports/whitechair_002_wrong_side_en.md`, `reports/pushed_sequences_umr_wuji.md` |
-| the OmniRetarget hand-bake bug (what was wrong before 2026-10-14) | section 9 here, `README_EN.md` section 8, `reports/figures/omni_hand_bake_bug.png` |
-| every other ablation (real-size objects, remapping, dense contact term, 12 iterations, multi-object) | `README_EN.md` section 6 |
+| the "hand on the far side of the chair" defect | `reports/whitechair_002_wrong_side.md`, `reports/pushed_sequences_umr_wuji.md` |
+| the OmniRetarget hand-bake bug (what was wrong before 2026-10-14) | section 9 here, `README.md` section 8, `reports/figures/omni_hand_bake_bug.png` |
+| every other ablation (real-size objects, remapping, dense contact term, 12 iterations, multi-object) | `README.md` section 6 |
 
 ### Glossary
 
@@ -264,11 +264,11 @@ verifies all of this in one go.
 
 | file | content |
 |---|---|
-| `body_stage_comparison_2026-10-17_en.md` (`.md` = Chinese original) | summary of all body-stage comparisons: UMR vs OmniRetarget, CoACD vs hull, pushed-off mechanism, finger collision on/off, final-stage penetration, recommendations |
+| `body_stage_comparison_2026-10-17.md` | summary of all body-stage comparisons: UMR vs OmniRetarget, CoACD vs hull, pushed-off mechanism, finger collision on/off, final-stage penetration, recommendations |
 | `umr_vs_omni_3ds.md` | UMR vs OmniRetarget on the three datasets after the hand-bake fix (English tables) |
 | `umr_finger_collision_3ds.md` | UMR body stage with / without finger collision, three datasets |
 | `pushed_sequences_umr_wuji.md` | list of sequences where the body stage pushes a hand across the object |
-| `whitechair_002_wrong_side_en.md` (`.md` = Chinese original) | geometric analysis of the defect on one OMOMO sequence |
+| `whitechair_002_wrong_side.md` | geometric analysis of the defect on one OMOMO sequence |
 | `figures/omni_hand_bake_bug.png` | what the OmniRetarget hand looked like before the bake fix |
 | `figures/sub16_whitechair_002_analysis.png`, `figures/scaling_conflict.png` | analysis plots |
 | `figures/pipeline_overview.png`, `figures/*_stages.png` | pipeline block diagram (`scripts/pipeline_figure.py`) and a stage-by-stage render of one HUMOTO sequence |

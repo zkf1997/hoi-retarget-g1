@@ -1,249 +1,251 @@
-# HiPHI 多序列人-物交互跟踪策略（G1 + Wuji Hand 2，holosoma / IsaacSim）
+# HiPHI multi-sequence human-object interaction tracking policy (G1 + Wuji Hand 2, holosoma / IsaacSim)
 
-用 `results_hiphi/pipe_final`（最终流水线：UMR 身体 → AnyTeleop 手指 → v3 联合细化）的 60 段 HiPHI 重定向结果，
-在 holosoma 的 whole-body tracking（WBT）框架上训练**一个**策略同时跟踪 60 段带物体的动作，重点保证手部跟踪精度。
+English version (2026-10-22).
+
+Uses the 60 HiPHI retargeting results in `results_hiphi/pipe_final` (final pipeline: UMR body → AnyTeleop fingers → v3 joint refinement)
+to train **one** policy on holosoma's whole-body tracking (WBT) framework that tracks all 60 sequences with objects at once, with the focus on hand tracking accuracy.
 
 ```
 wbt/
-├── convert_hiphi_to_holosoma.py   重定向结果 → holosoma 动作 npz + 每段物体 URDF
-├── hiphi_wbt/                     holosoma 插件（--import-file 注册）
-│   ├── robot.py                   69 DoF G1 + Wuji Hand 2 的 RobotConfig（103 个 body）
-│   ├── sim_multiasset.py          IsaacSim 子类：每个 env 一个物体资产（env i ← 资产 i % 60）
-│   ├── command.py                 FixedMotionCommand：env i 固定跟踪动作 i % 60；手部指标
-│   ├── action.py                  手指目标 = 参考手指姿态 + 残差 的关节位置动作
-│   ├── rewards.py                 指尖 / 腕 / 手指关节 跟踪奖励
-│   └── presets.py                 实验预设 exp:g1-wuji-hiphi-wbt（及 -fixhand 消融）
-├── eval_tracking.py               逐段评测：成功率、身体 / 腕 / 指尖 / 手指关节 / 物体误差
-├── plot_training.py               tensorboard 曲线 → PNG
-├── assets/robot/                  训练用 URDF（加了脚底接触点 link）；meshes → ../../urdf/g1_wuji_hand2/meshes
-├── assets/objects/<III>_<seq>.urdf  每段的物体 URDF（生成，git 忽略）
-└── data/motions/<III>_<seq>.npz   holosoma 动作数据（生成，git 忽略）
+├── convert_hiphi_to_holosoma.py   retargeting results → holosoma motion npz + per-sequence object URDF
+├── hiphi_wbt/                     holosoma plugin (registered via --import-file)
+│   ├── robot.py                   RobotConfig for the 69 DoF G1 + Wuji Hand 2 (103 bodies)
+│   ├── sim_multiasset.py          IsaacSim subclass: one object asset per env (env i ← asset i % 60)
+│   ├── command.py                 FixedMotionCommand: env i always tracks motion i % 60; hand metrics
+│   ├── action.py                  joint-position action with finger targets = reference finger pose + residual
+│   ├── rewards.py                 fingertip / wrist / finger-joint tracking rewards
+│   └── presets.py                 experiment preset exp:g1-wuji-hiphi-wbt (and the -fixhand ablation)
+├── eval_tracking.py               per-sequence evaluation: success rate, body / wrist / fingertip / finger-joint / object errors
+├── plot_training.py               tensorboard curves → PNG
+├── assets/robot/                  training URDF (with foot-sole contact-point links added); meshes → ../../urdf/g1_wuji_hand2/meshes
+├── assets/objects/<III>_<seq>.urdf  per-sequence object URDF (generated, git-ignored)
+└── data/motions/<III>_<seq>.npz   holosoma motion data (generated, git-ignored)
 ```
 
-环境：venv `/home/kaizhao/software/venvs/hswbt`（`--system-site-packages` 基于 conda `sonic` 的 IsaacSim 5.1 / IsaacLab 0.54.3，holosoma 以 editable 安装）。
-所有命令在仓库根目录执行，`PYTHONPATH=omomo_bench/wbt` 让 `hiphi_wbt.*` 可导入。
+Environment: venv `/home/kaizhao/software/venvs/hswbt` (`--system-site-packages` on top of the conda `sonic` IsaacSim 5.1 / IsaacLab 0.54.3; holosoma installed in editable mode).
+All commands run from the repository root; `PYTHONPATH=omomo_bench/wbt` makes `hiphi_wbt.*` importable.
 
-## 1. 数据转换
+## 1. Data conversion
 
 ```bash
 BENCH_DATASET=hiphi conda run -n umr python omomo_bench/wbt/convert_hiphi_to_holosoma.py   # --fps 50 --lane pipe_final
 ```
 
-- 30 fps 的 `qpos`（7 + 69）线性插值到 50 fps（IsaacSim 200 Hz 物理、decimation 4）；用 `robots/g1_29dof_wuji_hand2.xml` 做 MuJoCo 正运动学得到 103 个 body 的世界位姿，速度用差分。
-- 关节顺序 = 重定向结果的 MJCF 顺序；holosoma 按名字对齐（启动日志里 "order of the joint_names ... does not match" 是正常提示）。
-- 物体：位姿是源数据 × 该段的 `smpl_scale`（和重定向用的缩放世界一致）；URDF 用显示网格做 visual、CoACD 凸块做 collision，网格按 s 缩放，质量 = 名义质量 × s³（`NOMINAL_MASS` 按物体类别给出）。
-- 结果：60 段、182,922 帧（每段 2942–3269 帧 ≈ 60 s），`data/manifest.json` 记录序号、物体、缩放、质量。
+- The 30 fps `qpos` (7 + 69) is linearly interpolated to 50 fps (IsaacSim 200 Hz physics, decimation 4); MuJoCo forward kinematics with `robots/g1_29dof_wuji_hand2.xml` gives the world poses of the 103 bodies, velocities by finite differences.
+- Joint order = the MJCF order of the retargeting results; holosoma aligns by name (the "order of the joint_names ... does not match" message in the startup log is a normal notice).
+- Object: the pose is the source data × the sequence's `smpl_scale` (the same scaled world the retargeting uses); the URDF uses the display mesh as visual and CoACD convex pieces as collision, meshes scaled by s, mass = nominal mass × s³ (`NOMINAL_MASS` given per object category).
+- Result: 60 sequences, 182,922 frames (2942–3269 frames per sequence ≈ 60 s); `data/manifest.json` records index, object, scale and mass.
 
-## 2. 任务定义（`hiphi_wbt/presets.py`）
+## 2. Task definition (`hiphi_wbt/presets.py`)
 
-在 holosoma 的 `g1_29dof_wbt`（带物体的 WBT）上替换：
+Built on holosoma's `g1_29dof_wbt` (WBT with object) with these replacements:
 
-| 部分 | 做法 |
+| Part | Approach |
 |---|---|
-| 机器人 | `g1_wuji`：69 DoF、103 body（`collapse_fixed_joints=False` 保留指尖等固定 link）；身体关节的增益 / armature 沿用 G1 预设，手指 kp 0.6（拇指 CMC 1.0）、kd 0.03、armature 2e-4；开启自碰撞 |
-| 场景 | 每个 env 一个物体资产：`sim_multiasset.IsaacSim` 用 IsaacLab `MultiAssetSpawnerCfg(random_choice=False)`，env i 得到第 i % 60 个 URDF；`replicate_physics=False`；`env_spacing=6 m` |
-| 动作分配 | `FixedMotionCommand`：env i 永远跟踪动作 i % 60（和物体一致）；起始帧在段内均匀采样（10% 从第 0 帧开始），评测时都从第 0 帧 |
-| 跟踪 body | holosoma 的 14 个 body + 10 个指尖 |
-| 动作 | `ResidualReferenceJointPositionActionTerm`：手指关节（`^[lr]_`）的 PD 目标 = 参考手指姿态 + 0.25·effort/kp·a，零动作就是重定向手指姿态；身体关节同 holosoma（默认姿态 + 缩放动作） |
-| 观测 | actor：holosoma 共享观测 + 物体在机器人系下的位置、朝向；critic：holosoma 带物体的 critic 观测 |
-| 奖励 | holosoma 带物体 WBT 的全部项 + 指尖位置 exp（σ 0.08 m，权重 1.0）+ 腕位置 exp（σ 0.1，0.5）+ 手指关节 exp（σ 0.3 rad，0.5）；`undesired_contacts` 排除所有手部 link（手和物体接触是期望的） |
-| 终止 | `BadTrackingZOnly`（含物体位置 0.3 m / 朝向 1.0 rad 阈值）；训练 episode 10 s |
-| 随机化 | holosoma 带物体的随机化，物体质量系数改为 [0.8, 1.5] |
+| Robot | `g1_wuji`: 69 DoF, 103 bodies (`collapse_fixed_joints=False` keeps fixed links such as fingertips); body-joint gains / armature follow the G1 preset, finger kp 0.6 (thumb CMC 1.0), kd 0.03, armature 2e-4; self-collision enabled |
+| Scene | One object asset per env: `sim_multiasset.IsaacSim` uses IsaacLab `MultiAssetSpawnerCfg(random_choice=False)`, env i gets the i % 60-th URDF; `replicate_physics=False`; `env_spacing=6 m` |
+| Motion assignment | `FixedMotionCommand`: env i always tracks motion i % 60 (consistent with its object); start frames are sampled uniformly within the sequence (10% start from frame 0), evaluation always starts from frame 0 |
+| Tracked bodies | holosoma's 14 bodies + 10 fingertips |
+| Actions | `ResidualReferenceJointPositionActionTerm`: PD target of the finger joints (`^[lr]_`) = reference finger pose + 0.25·effort/kp·a, so zero action is the retargeted finger pose; body joints as in holosoma (default pose + scaled action) |
+| Observations | actor: holosoma shared observations + object position and orientation in the robot frame; critic: holosoma's with-object critic observations |
+| Rewards | all terms of holosoma's with-object WBT + fingertip position exp (σ 0.08 m, weight 1.0) + wrist position exp (σ 0.1, 0.5) + finger joint exp (σ 0.3 rad, 0.5); `undesired_contacts` excludes all hand links (hand-object contact is desired) |
+| Termination | `BadTrackingZOnly` (including object position 0.3 m / orientation 1.0 rad thresholds); training episode 10 s |
+| Randomization | holosoma's with-object randomization, object mass factor changed to [0.8, 1.5] |
 
-## 3. 训练 / 评测
+## 3. Training / evaluation
 
 ```bash
 PY=/home/kaizhao/software/venvs/hswbt/bin/python
-# 训练（2040 env = 34 轮 × 60 段；日志 logs/HiPHI_WBT/<time>-g1_wuji_hiphi_wbt-locomotion/，含 tensorboard 与 model_XXXXX.pt）
+# training (2040 env = 34 rounds × 60 sequences; logs in logs/HiPHI_WBT/<time>-g1_wuji_hiphi_wbt-locomotion/, with tensorboard and model_XXXXX.pt)
 PYTHONPATH=omomo_bench/wbt $PY holosoma/src/holosoma/holosoma/train_agent.py --import-file omomo_bench/wbt/hiphi_wbt/presets.py \
     exp:g1-wuji-hiphi-wbt logger:disabled --training.num_envs 2040 --training.headless True \
     --algo.config.num_learning_iterations 20000 --algo.config.save_interval 500
-# 曲线
+# curves
 $PY omomo_bench/wbt/plot_training.py logs/HiPHI_WBT/<run>
-# 逐段评测：60 个 env 各从第 0 帧播放到结尾（或被终止），输出 <run>/eval_tracking/model_XXXXX.{md,csv,_summary.json}
+# per-sequence evaluation: 60 envs each play from frame 0 to the end (or until terminated); writes <run>/eval_tracking/model_XXXXX.{md,csv,_summary.json}
 PYTHONPATH=omomo_bench/wbt $PY omomo_bench/wbt/eval_tracking.py --checkpoint logs/HiPHI_WBT/<run>/model_XXXXX.pt [--init-noise 0]
 ```
 
-评测指标（每段取存活帧的均值）：成功率（整段播完且未触发 bad-tracking 终止）、跟踪帧占比、身体 / 腕 / 指尖（均值与各帧最差指尖）/ 手指关节 / 物体位置与朝向误差。
+Evaluation metrics (per sequence, averaged over surviving frames): success rate (whole sequence played without triggering bad-tracking termination), fraction of tracked frames, body / wrist / fingertip (mean and per-frame worst fingertip) / finger-joint / object position and orientation errors.
 
-## 4. 吞吐量（RTX 4090，2040 env，2026-10-09）
+## 4. Throughput (RTX 4090, 2040 env, 2026-10-09)
 
-| 配置 | steps/s |
+| Configuration | steps/s |
 |---|---|
-| 默认（`env_spacing=0`，异构物体，手碰撞 + 自碰撞） | 3,000 |
-| 关自碰撞 | 3,400 |
-| 去掉手部碰撞几何 | 4,500 |
-| 同一物体 + `replicate_physics=True` | 8,900 |
-| **`env_spacing=6 m`（异构物体，保留手碰撞 + 自碰撞）** | **8,500** |
-| 去手碰撞 + 关自碰撞 + 同一物体 | 14,300 |
+| Default (`env_spacing=0`, heterogeneous objects, hand collision + self-collision) | 3,000 |
+| Self-collision off | 3,400 |
+| Hand collision geometry removed | 4,500 |
+| Same object + `replicate_physics=True` | 8,900 |
+| **`env_spacing=6 m` (heterogeneous objects, hand collision + self-collision kept)** | **8,500** |
+| No hand collision + self-collision off + same object | 14,300 |
 
-`env_spacing=0` 时 2040 个机器人在空间上重叠，PhysX 宽相位要处理大量跨 env 的候选对（即使最终被过滤），拉开 6 m 后速度恢复到和同构场景一样；异构资产本身几乎不影响速度。手部 54 个碰撞体约占剩余开销的一半，训练时保留。
-`presets.py` / `robot.py` 里的环境变量 `HIPHI_WBT_ENV_SPACING`、`HIPHI_WBT_SELF_COLL=0`、`HIPHI_WBT_NO_HAND_COLLISION=1`、`HIPHI_WBT_SINGLE_OBJECT=1` 只用于这类剖析。
+With `env_spacing=0` the 2040 robots overlap in space and the PhysX broad phase has to handle a large number of cross-env candidate pairs (even though they are filtered in the end); spacing them 6 m apart restores the speed of the homogeneous scene; heterogeneous assets by themselves barely affect speed. The 54 hand collision bodies account for about half of the remaining overhead and are kept for training.
+The environment variables `HIPHI_WBT_ENV_SPACING`, `HIPHI_WBT_SELF_COLL=0`, `HIPHI_WBT_NO_HAND_COLLISION=1`, `HIPHI_WBT_SINGLE_OBJECT=1` in `presets.py` / `robot.py` are only for this kind of profiling.
 
-## 5. 接触感知的改进（2026-10-09 下午，快速迭代中）
+## 5. Contact-aware improvements (2026-10-09 afternoon, fast iteration in progress)
 
-参考 FlashDexRetarget / UniCross / DexRepNet++ / Weave 的做法（详见对话记录），在插件里加了可开关的项，用环境变量 `HIPHI_WBT_VARIANT=geo,contact,future,bps,pen` 选择：
+Following FlashDexRetarget / UniCross / DexRepNet++ / Weave (see the conversation log for details), switchable terms are added to the plugin, selected with the environment variable `HIPHI_WBT_VARIANT=geo,contact,future,bps,pen`:
 
-| 旗标 | 内容 | 维度 / 权重 |
+| Flag | Content | Dimension / weight |
 |---|---|---|
-| （总是开） | actor 观测加参考物体在躯干系下的位置 / 朝向（holosoma 原版 actor 完全看不到物体目标） | 3 + 6 |
-| `geo` | 42 个手部关键点（腕 + 每指近 / 中 / 远 / 指尖 link 原点）到物体表面的带符号距离（截 ±10 cm）和法向（躯干系）+ 10 个指尖的接触标志 | 178 |
-| `bps` | 每个腕系下 4³ 个格点（±8 cm）采样的 SDF（动态 BPS / 局部占据） | 128 |
-| `future` | 0.1 s、0.2 s 后的参考关节角减当前关节角 + 参考物体位置 | 2 × 72 |
-| `contact` | 交互奖励 $r=\tfrac1{10}\sum_f \exp(-\max(0,d_f-d_f^{ref})/0.02)$：只罚"比参考更远"；机器人侧带符号距离、参考侧无符号距离；参考距离 > 5 cm 的指尖不参与 | 权重 1.0 |
-| `pen` | 手部关键点进入物体超过 1 cm 的深度之和 | 权重 −5 |
-| `vobj` | 物体虚拟控制器课程（ResMimic / DexMachina）：对物体施加朝参考位姿的 PD 外力 / 力矩（kp 60、kd 8，按质量缩放，限 150 N / 15 Nm），增益随平均 episode 长度从 50 步到 300 步线性衰减到 0 | 训练早期物体不掉、策略能看到更长的轨迹 |
+| (always on) | actor observation gains the reference object position / orientation in the torso frame (the stock holosoma actor cannot see the object target at all) | 3 + 6 |
+| `geo` | signed distance (clipped to ±10 cm) and normal (torso frame) from 42 hand keypoints (wrist + proximal / middle / distal / tip link origins of each finger) to the object surface + contact flags of the 10 fingertips | 178 |
+| `bps` | SDF sampled at 4³ grid points (±8 cm) in each wrist frame (dynamic BPS / local occupancy) | 128 |
+| `future` | reference joint angles 0.1 s and 0.2 s ahead minus current joint angles + reference object position | 2 × 72 |
+| `contact` | interaction reward $r=\tfrac1{10}\sum_f \exp(-\max(0,d_f-d_f^{ref})/0.02)$: only penalizes "farther than the reference"; signed distance on the robot side, unsigned on the reference side; fingertips with reference distance > 5 cm are excluded | weight 1.0 |
+| `pen` | sum of the depths by which hand keypoints penetrate the object beyond 1 cm | weight −5 |
+| `vobj` | object virtual-controller curriculum (ResMimic / DexMachina): PD external force / torque on the object towards the reference pose (kp 60, kd 8, scaled by mass, limited to 150 N / 15 Nm); the gain decays linearly to 0 as the mean episode length goes from 50 to 300 steps | the object does not drop early in training and the policy sees longer trajectories |
 
-几何来源：`build_object_sdf.py` 对每个物体的缩放后 CoACD 凸块算 96³ 带符号距离网格（AABB + 15 cm 边距，open3d 逐块取最小），`hiphi_wbt/geometry.py` 在 GPU 上三线性采样（60 个网格 212 MB），参考侧距离在启动时对全部 182,922 帧预先算好。参考里 51.6% 的"帧-指尖"距离 < 1.5 cm。
+Geometry source: `build_object_sdf.py` computes a 96³ signed-distance grid for each object's scaled CoACD convex pieces (AABB + 15 cm margin, open3d minimum over pieces); `hiphi_wbt/geometry.py` samples it trilinearly on the GPU (60 grids, 212 MB); reference-side distances are precomputed at startup for all 182,922 frames. In the reference, 51.6% of the "frame-fingertip" distances are < 1.5 cm.
 
-**快速迭代**：`HIPHI_WBT_MOTIONS=<tag>,<tag>` 把选中的动作 / 物体 / SDF 软链接到 `data/subsets/` 后只训练这些序列；预设 `exp:g1-wuji-hiphi-fast`（1024 env，项目 `HiPHI_WBT_fast`，运行名带旗标）。`wbt_logs/launch_fast.sh <window> '<flags>' [iters]` 一键在 tmux 里启动。
+**Fast iteration**: `HIPHI_WBT_MOTIONS=<tag>,<tag>` symlinks the selected motions / objects / SDFs into `data/subsets/` and trains only on those sequences; preset `exp:g1-wuji-hiphi-fast` (1024 env, project `HiPHI_WBT_fast`, run name carries the flags). `wbt_logs/launch_fast.sh <window> '<flags>' [iters]` launches it in tmux in one step.
 
-### 5.1 诊断：参考回放（2026-10-09 晚）
+### 5.1 Diagnosis: reference replay (2026-10-09 evening)
 
-`eval_tracking.py --replay`（所有关节开环跟踪参考姿态，`--dump-joints` 打印偏差最大的关节 / body）发现：
+`eval_tracking.py --replay` (all joints track the reference pose open-loop; `--dump-joints` prints the joints / bodies with the largest deviation) reveals:
 
-- **机器人自碰撞把手指推开**：开启自碰撞时，刚从参考姿态出发一步，拇指 IP、小指 MCP 等就偏离 10–16°，几步后 30–40°；手指 PD 放大 4 倍也没用。关掉自碰撞后第 0 步手指误差从 3.5° 降到 0.6°。原因是相邻指节的凸包碰撞体在关节处重叠（PhysX 只过滤直接相连的父子 link）。因此 `robot.py` 默认 `enable_self_collisions=False`（手-物碰撞不受影响），之前所有运行（全量 1402 次迭代、快速 A/B/C/D）都带着这个问题。
-- 开环回放下躯干在 0.3 s 内就开始倾倒（根位置误差 13 步 70 mm、12°），和 holosoma 一样需要策略闭环。
-- 手部质量 0.69 kg / 只（holosoma 半球手 0.12 kg），腕 pitch / yaw 力矩上限 5 Nm，重力矩约 0.6 Nm，不是瓶颈。
+- **Robot self-collision pushes the fingers apart**: with self-collision enabled, one step after starting from the reference pose the thumb IP, pinky MCP etc. already deviate by 10–16°, and 30–40° a few steps later; a 4× finger PD gain does not help. With self-collision off, the step-0 finger error drops from 3.5° to 0.6°. The cause is that the convex-hull collision bodies of adjacent phalanges overlap at the joint (PhysX only filters directly connected parent-child links). `robot.py` therefore defaults to `enable_self_collisions=False` (hand-object collision is unaffected); all previous runs (full 1402 iterations, fast A/B/C/D) carried this problem.
+- In open-loop replay the torso starts to topple within 0.3 s (root position error 70 mm, 12° at step 13); as with holosoma, closed-loop policy control is needed.
+- Hand mass 0.69 kg each (holosoma hemisphere hand 0.12 kg), wrist pitch / yaw torque limit 5 Nm, gravity torque about 0.6 Nm; not a bottleneck.
 
-快速实验 A/B/D 在 20:30 左右重启为 A2/B2/D2（自碰撞关闭）；同时跑一个 holosoma 原版 `exp:g1-29dof-wbt-w-object`（1024 env，400 次迭代，`wbt_logs/stock_ref.log`）作为学习速度参照。
+Fast experiments A/B/D were restarted around 20:30 as A2/B2/D2 (self-collision off); a stock holosoma `exp:g1-29dof-wbt-w-object` (1024 env, 400 iterations, `wbt_logs/stock_ref.log`) runs in parallel as a learning-speed reference.
 
-### 5.2 诊断：为什么 episode 一直只有十几步（2026-10-13）
+### 5.2 Diagnosis: why episodes stay at only a dozen steps (2026-10-13)
 
-快速实验 A2 / B2 / D2（2 段，1024 env，3000 次迭代）跑完后 episode 长度仍只有 16–22 步（0.3–0.4 s），策略噪声已经降到 0.33，评测从第 0 帧开始 1.2 s 内就倒。逐项排查（`term/bad_*` 指标记录每步触发哪个终止条件；踝和腕的 0.25 m 阈值各占一半）：
+After the fast experiments A2 / B2 / D2 (2 sequences, 1024 env, 3000 iterations) finish, the episode length is still only 16–22 steps (0.3–0.4 s), the policy noise has already dropped to 0.33, and evaluation from frame 0 falls within 1.2 s. Item-by-item investigation (the `term/bad_*` metrics record which termination condition fires at each step; the 0.25 m thresholds of the ankle and wrist each account for half):
 
-| 试验 | 300 次迭代时 episode 长度 |
+| Trial | Episode length at 300 iterations |
 |---|---|
-| holosoma 原版 `g1-29dof-wbt-w-object`（1024 env） | 23（500 次 28） |
-| 我们 69 DoF（A2 / E，E 已换 holosoma 脚碰撞 + 50 Nm 踝） | 7–8 且在下降 |
-| 我们 **手指关节固定**（F，29 DoF 动作，`HIPHI_WBT_FROZEN_HAND=1`） | 17 且在上升（400 次 20） |
+| stock holosoma `g1-29dof-wbt-w-object` (1024 env) | 23 (28 at 500) |
+| our 69 DoF (A2 / E; E already uses holosoma foot collision + 50 Nm ankle) | 7–8 and falling |
+| ours with **finger joints fixed** (F, 29 DoF actions, `HIPHI_WBT_FROZEN_HAND=1`) | 17 and rising (20 at 400) |
 
-结论：不是脚（rev_1_0 URDF 的脚是 4 个 5 mm 小球，已换成 holosoma 的圆柱脚，`HIPHI_WBT_URDF=hscoll` 为默认）、不是踝力矩（35 → 50 Nm）、不是自碰撞（已关），而是 **40 个手指动作维度**：手指残差的范围是 holosoma 的 0.25 rad / 单位动作，初始噪声 1.0 时每步 ±14° 的随机手指动作让身体学不起来。起初怀疑是手指的探索噪声，但 G（`HIPHI_WBT_FIXHAND=1`，策略手指输出被忽略）和 H（手指残差缩到 0.2 倍）同样在 200 次迭代后 episode 缩短到 7–8 步，所以不是动作本身。
+Conclusion: it is not the feet (the rev_1_0 URDF foot is 4 small 5 mm spheres, replaced by holosoma's cylindrical foot, `HIPHI_WBT_URDF=hscoll` is the default), not the ankle torque (35 → 50 Nm), not self-collision (already off), but the **40 finger action dimensions**: the finger residual range is holosoma's 0.25 rad per action unit, and with initial noise 1.0 the random ±14° finger actions at every step keep the body from learning. Exploration noise in the fingers was suspected first, but G (`HIPHI_WBT_FIXHAND=1`, the policy's finger output is ignored) and H (finger residual scaled to 0.2×) likewise shrink to 7–8 steps after 200 iterations, so it is not the actions themselves.
 
-**真正原因是 holosoma 的 `action_rate_l2` 惩罚（权重 −0.1）对全部动作维度求和**：单位探索噪声下每维每步 E[(Δa)²] ≈ 2，69 维比 29 维多出 2.8 倍，使起始回报从原版的 −0.4 变成 −2.4、每步期望奖励为负，于是策略学会尽快摔倒结束 episode（episode 长度随训练下降的原因）。F 没有手指动作维度所以正常。修正：`action_rate_l2` 改为只对身体关节求和（`hiphi_wbt.rewards:penalty_action_rate_subset`，权重 −0.1），手指单独一项权重 −0.01；起始回报回到 −0.7。保留 `reference_action_scale=0.2` 和 `HIPHI_WBT_FIXHAND` 两个开关。实验 I（基线）、J（`geo,contact`）用修正后的奖励在跑。
+**The real cause is holosoma's `action_rate_l2` penalty (weight −0.1), which sums over all action dimensions**: with unit exploration noise E[(Δa)²] ≈ 2 per dimension per step, 69 dimensions are 2.8× more than 29, which turns the initial return from the stock −0.4 into −2.4 and makes the expected per-step reward negative, so the policy learns to fall as fast as possible to end the episode (the reason the episode length decreases with training). F has no finger action dimensions and is therefore fine. Fix: `action_rate_l2` now sums only over body joints (`hiphi_wbt.rewards:penalty_action_rate_subset`, weight −0.1), with a separate finger term at weight −0.01; the initial return is back to −0.7. The two switches `reference_action_scale=0.2` and `HIPHI_WBT_FIXHAND` are kept. Experiments I (baseline) and J (`geo,contact`) are running with the corrected reward.
 
-### 5.3 结果（I / J / F，1500 次迭代）与自适应采样（2026-10-13 晚）
+### 5.3 Results (I / J / F, 1500 iterations) and adaptive sampling (2026-10-13 evening)
 
-| 运行 | 1500 次时 episode 长度 | 备注 |
+| Run | Episode length at 1500 | Notes |
 |---|---|---|
-| F 手指冻结（29 DoF） | 30 | 身体误差 0.13 m（张开的手指计入跟踪 body） |
-| I 基线（修正后奖励） | 17 | 评测从第 0 帧起 1.3 s 内倒 |
-| J `geo,contact` | 18 | 和 I 无差别；指尖-物体距离误差 39 mm |
-| holosoma 原版（参照） | 56（1200 次） | 但它的 clip 只有 6.5 s，我们的是 62 s |
+| F fingers frozen (29 DoF) | 30 | body error 0.13 m (the open fingers count as tracked bodies) |
+| I baseline (corrected reward) | 17 | evaluation from frame 0 falls within 1.3 s |
+| J `geo,contact` | 18 | no difference from I; fingertip-object distance error 39 mm |
+| stock holosoma (reference) | 56 (at 1200) | but its clips are only 6.5 s, ours are 62 s |
 
-I / J 评测仍然 0 成功；手指关节误差随训练上升（残差被用来做别的事），腕 / 肘 / 膝在倒地前就偏 20–30°。
+I / J evaluation still has 0 successes; the finger-joint error grows with training (the residual is used for something else), and wrist / elbow / knee already deviate by 20–30° before the fall.
 
-原版和我们另一个差别是 **自适应起始帧采样**（`use_adaptive_timesteps_sampler=True`，BeyondMimic 式：按失败位置的 1 s 分箱直方图采样起点），我们因为 env 和动作绑定一直关着。现在 `FixedMotionCommand` 加了按动作限制的版本（`adaptive_per_motion`，默认开，全局分箱概率按各 env 自己的 clip 掩码后归一化，`HIPHI_WBT_ADAPTIVE=0` 关）。实验 K（基线）、L（`geo,contact`）、N（只用 `002_rock`，几乎不走动的序列，看能不能学会站着操作）在跑。
+Another difference from the stock setup is **adaptive start-frame sampling** (`use_adaptive_timesteps_sampler=True`, BeyondMimic style: start points sampled from a 1 s-binned histogram of failure positions), which we kept off because envs are bound to motions. `FixedMotionCommand` now has a per-motion restricted version (`adaptive_per_motion`, on by default; the global bin probabilities are masked by each env's own clip and renormalized; `HIPHI_WBT_ADAPTIVE=0` turns it off). Experiments K (baseline), L (`geo,contact`), N (only `002_rock`, a sequence with almost no walking, to see whether standing manipulation can be learned) are running.
 
-### 5.4 开环回放诊断（2026-10-13 深夜）
+### 5.4 Open-loop replay diagnosis (2026-10-13 late night)
 
-`eval_tracking.py` 新增诊断开关：`--freeze`（参考停在第 0 帧）、`--replay`（全关节开环 PD 跟踪参考）、`HIPHI_WBT_OBJECT_OFFSET`（把物体挪走）、`HIPHI_WBT_ZERO_INIT_VEL`、`--trace-joints`（逐步打印 q / 参考 / 速度 / 施加力矩）、`--poke-ref`、`--urdf` / `--fresh-robot` / `--finger-kp` / `--finger-kd` / `--finger-armature` / `--self-coll`。评测时 `HIPHI_WBT_MOTIONS` 现在会覆盖 checkpoint 里的动作目录（之前评测"002 单段"实际跑的是 checkpoint 里的 000）。
+New diagnostic switches in `eval_tracking.py`: `--freeze` (reference stays at frame 0), `--replay` (all joints track the reference open-loop with PD), `HIPHI_WBT_OBJECT_OFFSET` (moves the object away), `HIPHI_WBT_ZERO_INIT_VEL`, `--trace-joints` (prints q / reference / velocity / applied torque per step), `--poke-ref`, `--urdf` / `--fresh-robot` / `--finger-kp` / `--finger-kd` / `--finger-armature` / `--self-coll`. During evaluation `HIPHI_WBT_MOTIONS` now overrides the motion directory stored in the checkpoint (the earlier "002 single-sequence" evaluation actually ran the 000 from the checkpoint).
 
-结论：
-- holosoma 原版 G1 在开环（冻结参考、PD 保持）下也在 0.4 s 内倒下：这套增益是实机级别的"软"增益，靠策略闭环补偿，开环站不住是正常的。
-- 我们的机器人多一个问题：**肩关节增益（kp 14）扛不住 0.92 kg 的手**。HiPHI 这两段里手臂外展 73°，肩 roll 的静态重力矩约 9–10 Nm，开环下肩 roll 在 0.4 s 内下垂 50°，腕误差随之超过 0.25 m 触发终止。策略要用约 1.5 个动作单位的常值偏置来补，拖慢学习。新增 `HIPHI_WBT_ARM_KP`（肩 / 肘 / 腕 kp 倍数，kd 按 sqrt 缩放），实验 P（×3 基线）、Q（×3 + `geo,contact`）对比 K（×1）。
-- 手指外展关节（pinky / ring / middle abd）在开环下以 3–5 rad/s 漂向负极限，PD 力矩饱和在 0.2 Nm 也拦不住；手指 kp ×4、kd ×10、armature ×50、去掉手部碰撞、挪走物体都不改变这个现象，原因未明（怀疑 PhysX 关节摩擦按约束力缩放或 USD 转换的轴向），暂不影响身体学习的结论。
-- 回放 F（手指固定）的 checkpoint 时发现旧 `_frozenhand.urdf` 已被重新生成逻辑删除，`frozen2` 评测失败；仅诊断用途。
+Conclusions:
+- The stock holosoma G1 also falls within 0.4 s open-loop (frozen reference, PD hold): these gains are real-robot-level "soft" gains that rely on closed-loop policy compensation, so not standing open-loop is normal.
+- Our robot has one more problem: **the shoulder gains (kp 14) cannot hold the 0.92 kg hand**. In these two HiPHI sequences the arms abduct 73°, the static gravity torque on shoulder roll is about 9–10 Nm, and open-loop the shoulder roll sags 50° within 0.4 s, after which the wrist error exceeds 0.25 m and triggers termination. The policy has to compensate with a constant bias of about 1.5 action units, which slows learning. New `HIPHI_WBT_ARM_KP` (shoulder / elbow / wrist kp multiplier, kd scaled by sqrt); experiments P (×3 baseline), Q (×3 + `geo,contact`) compared against K (×1).
+- The finger abduction joints (pinky / ring / middle abd) drift towards the negative limit at 3–5 rad/s open-loop, and the PD torque saturating at 0.2 Nm cannot stop it; finger kp ×4, kd ×10, armature ×50, removing hand collision and moving the object away do not change this; cause unknown (suspected PhysX joint friction scaling with constraint force, or the axis in the USD conversion); for now it does not affect the conclusions on body learning.
+- When replaying the F (fingers fixed) checkpoint, the old `_frozenhand.urdf` had been deleted by the regeneration logic and the `frozen2` evaluation failed; diagnostic use only.
 
-### 5.5 继续排查学习速度（2026-10-14 凌晨）
+### 5.5 Further investigation of learning speed (2026-10-14 early morning)
 
-| 运行 | 设置 | 300 次 | 备注 |
+| Run | Setting | At 300 | Notes |
 |---|---|---|---|
-| K | 基线 + 自适应起点采样 | 13.8 | 900 次 16 |
-| P / Q | 肩肘腕 kp ×3（身体仍是默认姿态 + 动作） | 更差 | 刚性手臂把手拉向默认姿态，腕终止更多，停掉 |
-| R | 全身"参考 + 残差"动作（`HIPHI_WBT_RESIDUAL=all`） | 14.8 | |
-| S | R + 肩肘腕 kp ×3 | 15.3 | |
-| stock_on_hiphi | holosoma 原版 29 DoF G1（球手、原版箱子）直接跟踪我们的 002 npz（`stock_on_hiphi.py`） | 跑中 | 区分"数据难"还是"我们的机器人 / 手慢" |
+| K | baseline + adaptive start sampling | 13.8 | 16 at 900 |
+| P / Q | shoulder / elbow / wrist kp ×3 (body still default pose + action) | worse | the stiff arm pulls the hand towards the default pose, more wrist terminations, stopped |
+| R | whole-body "reference + residual" actions (`HIPHI_WBT_RESIDUAL=all`) | 14.8 | |
+| S | R + shoulder / elbow / wrist kp ×3 | 15.3 | |
+| stock_on_hiphi | stock holosoma 29 DoF G1 (sphere hands, stock box) directly tracking our 002 npz (`stock_on_hiphi.py`) | running | separates "hard data" from "our robot / hand is slow" |
 
-K 策略（1000 次）在 002 第 0 帧起：30 步内根位置误差 < 4 cm，但肘 / 腕逐渐偏 25–38°，指尖误差 100–200 mm，35 步后躯干倾斜，64 步倒下。
+Policy K (1000 iterations) from frame 0 of 002: root position error < 4 cm within 30 steps, but elbow / wrist gradually deviate 25–38°, fingertip error 100–200 mm, torso tilts after step 35, falls at step 64.
 
-### 5.6 二分定位：是数据还是机器人（2026-10-14 凌晨）
+### 5.6 Bisection: data or robot (2026-10-14 early morning)
 
-`stock_on_hiphi.py` 让 holosoma **原版** 29 DoF G1（球手、原版箱子、原版奖励 / 观测 / 终止）直接跟踪我们的 002 npz（加载器按名字取 body / 关节，69 关节文件里多余的手指列被忽略）：
+`stock_on_hiphi.py` lets the **stock** holosoma 29 DoF G1 (sphere hands, stock box, stock reward / observation / termination) directly track our 002 npz (the loader picks bodies / joints by name; the extra finger columns in the 69-joint file are ignored):
 
-| 运行（都在 002 单段、1024 env） | 300 次 | 之后 |
+| Run (all on single sequence 002, 1024 env) | At 300 | Later |
 |---|---|---|
-| 原版 G1 + 我们的 002 数据 (`exp:stock-on-hiphi`) | **30** | 450 次 44、650 次 **92** |
-| 原版任务配置 + 我们的 69 DoF 机器人 (`exp:stock-on-hiphi-wuji`) | 9 | 不涨 |
-| 原版任务配置 + 我们的机器人、手指冻结（29 DoF，手质量保留） | 11 | 不涨 |
-| 我们的任务配置 K / R / S | 14–15 | 1500 次 17 |
+| stock G1 + our 002 data (`exp:stock-on-hiphi`) | **30** | 44 at 450, **92** at 650 |
+| stock task config + our 69 DoF robot (`exp:stock-on-hiphi-wuji`) | 9 | no growth |
+| stock task config + our robot, fingers frozen (29 DoF, hand mass kept) | 11 | no growth |
+| our task config K / R / S | 14–15 | 17 at 1500 |
 
-结论：**数据没问题，任务配置也不是主因，问题在机器人模型本身**（即使手指冻结成 29 DoF 也学不动）。剩下的差异：手质量 0.92 kg 对 0.12 kg、103 个 body（固定关节不合并）、URDF 本身。正在跑两个进一步的二分：原版 G1 把球手质量改成 0.92 kg（`exp:stock-on-hiphi-heavyhand`），以及我们的机器人手指冻结 + 固定关节合并成 32 个 body（`HIPHI_WBT_COLLAPSE=1`）。
+Conclusion: **the data is fine, the task configuration is not the main cause, the problem is in the robot model itself** (it does not learn even with the fingers frozen to 29 DoF). Remaining differences: hand mass 0.92 kg vs 0.12 kg, 103 bodies (fixed joints not merged), the URDF itself. Two further bisections are running: the stock G1 with its sphere-hand mass changed to 0.92 kg (`exp:stock-on-hiphi-heavyhand`), and our robot with fingers frozen + fixed joints merged into 32 bodies (`HIPHI_WBT_COLLAPSE=1`).
 
-### 5.7 根因：空 link 在 IsaacSim 里默认 1 kg（2026-10-14 上午）
+### 5.7 Root cause: empty links default to 1 kg in IsaacSim (2026-10-14 morning)
 
-二分继续：原版 G1 把球手改成 0.92 kg 后学习速度不变（300 次 29 步），所以不是手的质量；我们的机器人手指冻结 + 固定关节合并成 32 个 body 后恢复到 23 步 / 300 次（500 次 42），说明问题在那些被合并掉的 link 里。用 `EVAL_PRINT_MASSES=1` 打印仿真里的质量：**总质量 44.4 kg（URDF 34.4 kg），10 个指尖 link `<link name="l_pinky_tip" />` 没有 `<inertial>`，IsaacSim 给了每个 1 kg、惯量 1e-4**，还有 imu / d435 / mid360 4 个空 link 也各 1 kg。即每只手末端挂着 5 kg：手指 PD（0.2 Nm 上限）扛不住 1 kg 指尖所以"漂移"，肩关节扛不住 5 kg 所以开环 0.4 s 下垂 50°，策略当然学不动；手指冻结 / 合并固定关节的实验只是把这些质量挪到了腕上。
+The bisection continues: the stock G1 with the sphere hand set to 0.92 kg learns at the same speed (29 steps at 300), so it is not the hand mass; our robot with fingers frozen + fixed joints merged into 32 bodies recovers to 23 steps / 300 (42 at 500), so the problem is in the links that get merged away. Printing the simulated masses with `EVAL_PRINT_MASSES=1`: **total mass 44.4 kg (URDF 34.4 kg); the 10 fingertip links `<link name="l_pinky_tip" />` have no `<inertial>`, and IsaacSim gives each 1 kg and inertia 1e-4**; the 4 empty links imu / d435 / mid360 also get 1 kg each. So 5 kg hangs at the end of each hand: the finger PD (0.2 Nm limit) cannot hold a 1 kg fingertip, hence the "drift"; the shoulder cannot hold 5 kg, hence the 50° sag within 0.4 s open-loop; of course the policy cannot learn. The finger-frozen / merged-fixed-joint experiments merely moved these masses to the wrist.
 
-修复：三个 URDF 里 14 个空 link 都加 5 g / 1e-7 的 inertial。修复后仿真总质量 34.46 kg，开环回放里小指外展误差 < 1°、肩 roll 只是重力下垂到 37° 后回弹。同时保留 `collapse_fixed_joints=True`（82 个 body：指尖和脚底接触点 `dont_collapse`）。实验 V（基线）、W（`geo,contact`）用修复后的模型重跑。
+Fix: all 14 empty links in the three URDFs get an inertial of 5 g / 1e-7. After the fix the simulated total mass is 34.46 kg, in open-loop replay the pinky abduction error is < 1°, and the shoulder roll only sags under gravity to 37° and then bounces back. `collapse_fixed_joints=True` is kept at the same time (82 bodies: fingertips and foot-sole contact points are `dont_collapse`). Experiments V (baseline) and W (`geo,contact`) are rerun with the fixed model.
 
-之前所有训练结果（I–U、全量 1402 次）都带着这 14 kg 的错误质量，只能作废。
+All previous training results (I–U, the full 1402-iteration run) carried these 14 kg of wrong mass and are void.
 
-### 5.8 修复后的对照（2026-10-14 下午）
+### 5.8 Comparison after the fix (2026-10-14 afternoon)
 
-| 运行（002 单段、1024 env） | 200 次 | 300 次 | 400 次 |
+| Run (single sequence 002, 1024 env) | At 200 | At 300 | At 400 |
 |---|---|---|---|
-| 原版任务配置 + 修复后的机器人（手指冻结 29 DoF，`stockWF2`） | 13 | 22 | 32（550 次 50） |
-| 我们的配置 X（69 DoF） | 16.5 | 16 | 17.7，之后不涨 |
-| X + 原版箱子（Y） | 17.5 | 18 | 19.6 |
-| X − 手部奖励项（Z） | 14 | 16.5 | 14 |
-| 我们的预设、所有开关调成原版行为、69 维动作（AA） | 8 | 14.6 | |
-| AA 但 29 维动作（手指冻结，AB） | 跑中 | | |
+| stock task config + fixed robot (fingers frozen, 29 DoF, `stockWF2`) | 13 | 22 | 32 (50 at 550) |
+| our config X (69 DoF) | 16.5 | 16 | 17.7, no growth afterwards |
+| X + stock box (Y) | 17.5 | 18 | 19.6 |
+| X − hand reward terms (Z) | 14 | 16.5 | 14 |
+| our preset, all switches set to stock behavior, 69-dim actions (AA) | 8 | 14.6 | |
+| AA but 29-dim actions (fingers frozen, AB) | running | | |
 
-机器人模型修好后，原版任务配置能正常学；我们的任务配置在同一段上 300 次后停在 16–20 步。物体、手部奖励、观测、自适应采样都不是原因（Y / Z / AA）。剩下的嫌疑是 **69 维动作空间本身**：手指 40 维即使被忽略（fixhand）也进入 PPO 的高斯策略、熵和 KL，KL 偏高时自适应学习率被压回 1e-5（tensorboard 里 AA 的 actor LR 在 1e-5 和 7.6e-5 之间跳，原版稳定在 7.6e-5），且噪声 std 衰减更慢（0.79 对 0.57）。AB 用来验证。
+With the robot model fixed, the stock task configuration learns normally; our task configuration stalls at 16–20 steps after 300 iterations on the same sequence. Object, hand rewards, observations and adaptive sampling are not the cause (Y / Z / AA). The remaining suspect is the **69-dim action space itself**: the 40 finger dimensions, even when ignored (fixhand), enter the PPO Gaussian policy, the entropy and the KL; when the KL is high, the adaptive learning rate is pushed back to 1e-5 (in tensorboard AA's actor LR jumps between 1e-5 and 7.6e-5 while the stock run stays at 7.6e-5), and the noise std decays more slowly (0.79 vs 0.57). AB is used to verify this.
 
-### 5.9 继续二分（2026-10-14 下午 – 晚）
+### 5.9 Further bisection (2026-10-14 afternoon – evening)
 
-| 运行（002 单段） | 200 | 300 | 400 | 说明 |
+| Run (single sequence 002) | 200 | 300 | 400 | Notes |
 |---|---|---|---|---|
-| AB：AA 的开关 + 手指冻结（29 维） | 14.5 | 30 | 44.5 | **和原版一样快，甚至更快** |
-| AC：X + `desired_kl` 0.02 | 17.9 | 15 | | 无效 |
-| AE：X + 手指协同动作（41 维，`HIPHI_WBT_SYNERGY=1`） | 15.6 | 16.2 | | 无效 → 不是动作维数 |
-| AH：AA + 去掉手部碰撞几何 | 8.9 | | | 和 AA 一样 → 不是手指-物体接触 |
-| AI：AA + 手指 kp ×0.1 | 9.1 | | | 同上 |
-| AJ：AA + 观测只含身体关节（`HIPHI_WBT_BODY_OBS=1`） | 跑中 | | | 手指 40 个关节位置 / 速度 / 动作是否是观测噪声 |
-| AK：X + 协同动作 + 身体观测 + 手指相对参考 | 跑中 | | | |
+| AB: AA's switches + fingers frozen (29-dim) | 14.5 | 30 | 44.5 | **as fast as stock, even faster** |
+| AC: X + `desired_kl` 0.02 | 17.9 | 15 | | no effect |
+| AE: X + finger synergy actions (41-dim, `HIPHI_WBT_SYNERGY=1`) | 15.6 | 16.2 | | no effect → not the action dimensionality |
+| AH: AA + hand collision geometry removed | 8.9 | | | same as AA → not finger-object contact |
+| AI: AA + finger kp ×0.1 | 9.1 | | | same |
+| AJ: AA + observations with body joints only (`HIPHI_WBT_BODY_OBS=1`) | running | | | whether the 40 finger joint positions / velocities / actions are observation noise |
+| AK: X + synergy actions + body observations + fingers relative to reference | running | | | |
 
-AA 与 AB 的唯一差别是手指关节"PD 跟踪参考（动作被忽略）"还是"固定关节"，两者的差距（19 对 44）说明问题来自带手指关节本身。继续拆：
+The only difference between AA and AB is whether the finger joints "PD-track the reference (action ignored)" or are "fixed joints"; the gap between them (19 vs 44) shows the problem comes from having the finger joints at all. Further split:
 
-| 运行（AA 的开关 + …，002） | 300 | 400 | 550 |
+| Run (AA's switches + …, 002) | 300 | 400 | 550 |
 |---|---|---|---|
-| AA：69 维动作 | 14.6 | 19.4 | |
-| AJ：AA + 观测去掉手指 | 同 AA | | | 
-| AL：41 维（协同） | 17.9 | 25 | 30 |
-| AM：29 维（手指只回放参考，`HIPHI_WBT_SYNERGY=body`） | 20.4 | 27.7 | 36 |
-| AB：29 维、手指固定关节 | 30 | 44.5 | 57 |
+| AA: 69-dim actions | 14.6 | 19.4 | |
+| AJ: AA + fingers removed from observations | same as AA | | | 
+| AL: 41-dim (synergy) | 17.9 | 25 | 30 |
+| AM: 29-dim (fingers only replay the reference, `HIPHI_WBT_SYNERGY=body`) | 20.4 | 27.7 | 36 |
+| AB: 29-dim, fingers as fixed joints | 30 | 44.5 | 57 |
 
-结论：**两个因素叠加**。(1) 策略动作维数：69 → 41 → 29 维逐级变快（无效的手指维度抬高 KL / 重要性比的方差）；(2) 手指按参考闭合抓箱子本身让平衡更难（AM 对 AB）。AN（AM + 去掉手部碰撞）500 次 20.8、AO（AM + 我们的 1.1 kg 箱子）500 次 21.6，都不比 AM 好（去掉手碰撞后箱子失去支撑反而更难），说明剩余差距是"用手指按参考抓着箱子"这个任务本身更难，以及单种子实验 ±5 步的噪声，不再是 bug。
+Conclusion: **two factors add up**. (1) Policy action dimensionality: 69 → 41 → 29 dims gets progressively faster (the ineffective finger dimensions raise the variance of the KL / importance ratio); (2) the fingers closing on the box per the reference makes balance harder by itself (AM vs AB). AN (AM + hand collision removed) 20.8 at 500 and AO (AM + our 1.1 kg box) 21.6 at 500 are no better than AM (without hand collision the box loses its support and it gets harder), so the remaining gap is the task of "holding the box with the fingers per the reference" being harder in itself, plus ±5-step noise of single-seed experiments; no longer a bug.
 
-**当前默认配置**：修复质量的 82 body 模型、`HIPHI_WBT_SYNERGY=1`（41 维：29 身体 + 每手 6 个协同残差）、自适应起点采样、`geo,contact`。AF（基线）/ AG（`geo,contact`）/ AP（`geo,contact,vobj`）在两段上跑 2000 次用于选型，之后回到 60 段全量。
+**Current default configuration**: mass-fixed 82-body model, `HIPHI_WBT_SYNERGY=1` (41 dims: 29 body + 6 synergy residuals per hand), adaptive start sampling, `geo,contact`. AF (baseline) / AG (`geo,contact`) / AP (`geo,contact,vobj`) run 2000 iterations on two sequences for model selection, then back to the full 60 sequences.
 
-### 5.10 评测里的真正难点（2026-10-14 晚）
+### 5.10 The real difficulty in evaluation (2026-10-14 evening)
 
-AG（协同动作 + `geo,contact`，两段，1000 次）从第 0 帧闭环评测：身体误差 43 mm、腕 18 mm、指尖 37 mm 都不错，但 **第 64 步两段同时被 `bad_object_pos` 终止**：两段都是箱子放在地上、第 32 步左右手到达箱子、第 35–64 步以 1.3 m/s 把 1.1 kg 的箱子提起来；策略跟上了身体却没把箱子抓起来（指尖-物体距离从 42 mm 跳到 148 mm，箱子留在地上，误差超过 0.3 m）。所以从第 0 帧起的成功率衡量的是"快速抓起地上的箱子"这一最难的瞬间。
+AG (synergy actions + `geo,contact`, two sequences, 1000 iterations), closed-loop evaluation from frame 0: body error 43 mm, wrist 18 mm, fingertip 37 mm are all fine, but **both sequences are terminated by `bad_object_pos` at step 64 at the same time**: in both the box is on the ground, the left / right hands reach the box around step 32, and in steps 35–64 the 1.1 kg box is lifted at 1.3 m/s; the policy follows the body but does not pick up the box (the fingertip-object distance jumps from 42 mm to 148 mm, the box stays on the ground, error exceeds 0.3 m). So the success rate from frame 0 measures the single hardest moment, "quickly lift the box off the ground".
 
-对策：物体虚拟控制器课程（`vobj`，AP 在跑）、更长训练、可能的手指增益；评测里增加从中段（已持物）起步的指标。
+Countermeasures: object virtual-controller curriculum (`vobj`, AP running), longer training, possibly finger gains; add evaluation metrics that start mid-sequence (object already held).
 
-### 5.11 第二个根因：60 个 env 实际全在用 env_0 的箱子（2026-10-15）
+### 5.11 Second root cause: all 60 envs actually use env_0's box (2026-10-15)
 
-全量 12500 次的策略评测：成功 3/60，5 段晾衣架在第 12 步全部被 `bad_object_pos` 终止。`EVAL_PRINT_OBJECTS=1` 显示 **59/60 个 env 的物体质量都是 1.1021 kg（env_0 的 Box_A）**。原因：holosoma 先生成物体再 `clone_environments(copy_from_source=False)`，env_i 以 inherit 方式实时继承 env_0 的整个子树，于是每个 env 里既有自己的物体又有 env_0 的物体，而 IsaacLab 刚体视图的路径模式取自 env_0 的 body 名，所有 env 都把 env_0 的箱子当成"物体"，真正的物体成了不受控的多余刚体。之前所有多物体训练（含全量 train2）都受影响；两段快速实验（000、002 都是 Box_A）不受影响。
+Evaluation of the full-run policy at 12500 iterations: 3/60 successes; the 5 clothes-rack sequences are all terminated by `bad_object_pos` at step 12. `EVAL_PRINT_OBJECTS=1` shows **the object mass in 59/60 envs is 1.1021 kg (env_0's Box_A)**. Cause: holosoma spawns the objects first and then calls `clone_environments(copy_from_source=False)`; env_i inherits env_0's entire subtree live, so each env contains both its own object and env_0's object, and since the path pattern of the IsaacLab rigid-body view is taken from env_0's body name, all envs treat env_0's box as "the object" while the real object becomes an uncontrolled extra rigid body. All previous multi-object training (including the full train2 run) is affected; the two-sequence fast experiments (000 and 002 are both Box_A) are not.
 
-试过：深拷贝克隆（PhysX GPU 视图崩溃）、停用继承来的副本（视图模式只匹配 env_0）、统一 body 名（质量等属性仍被 env_0 的强意见覆盖）。最终修复（`sim_multiasset.py`）：物体放到 env 子树之外 `/World/hiphi_objects/env_i/object`（单位变换，holosoma 本来就按世界坐标 + env 原点写位姿），克隆之后生成；物体 URDF 改为 `assets/objects/<tag>/hiphi_object.urdf`、body link 统一叫 `object_body`。验证：0/60 质量不匹配，晾衣架不再第 12 步失败；现在最早的失败是足球（`bad_object_ori`，球滚动时朝向本来就无意义）。
+Tried: deep-copy cloning (PhysX GPU view crashes), deactivating the inherited copies (the view pattern still only matches env_0), unifying body names (mass and other attributes are still overridden by env_0's stronger opinion). Final fix (`sim_multiasset.py`): objects are placed outside the env subtree at `/World/hiphi_objects/env_i/object` (identity transform; holosoma already writes poses in world coordinates + env origin) and spawned after cloning; the object URDF becomes `assets/objects/<tag>/hiphi_object.urdf` and the body link is uniformly named `object_body`. Verification: 0/60 mass mismatches, the clothes rack no longer fails at step 12; the earliest failure is now the soccer ball (`bad_object_ori`; the orientation of a rolling ball is meaningless anyway).
 
-全量训练用修复后的场景重启（`geo,contact,vobj`，协同动作），4.9 s/迭代，目录 `logs/HiPHI_WBT/20261015_125909-g1_wuji_hiphi_wbt_contact-geo-vobj_syn-locomotion`，tmux `wbt:train4`。
+Full training restarted with the fixed scene (`geo,contact,vobj`, synergy actions), 4.9 s/iteration, directory `logs/HiPHI_WBT/20261015_125909-g1_wuji_hiphi_wbt_contact-geo-vobj_syn-locomotion`, tmux `wbt:train4`.
 
-### 5.12 物体辅助力泄漏到评测（2026-10-20）
+### 5.12 Object assist force leaking into evaluation (2026-10-20)
 
-`vobj` 课程的虚拟 PD 力按"训练平均 episode 长度"衰减（50 步全开、300 步关）。全量训练里 episode 一直 40–50 步，所以 **整个训练过程辅助力都是满的**（`assist/scale` ≈ 1.0），策略从来不需要自己搬动物体；评测时 checkpoint 的配置里也带着 `object_assist`，物体在不被接触时也会被拉向参考位姿。现在 `eval_tracking.py` 默认 `HIPHI_WBT_NO_ASSIST=1`。
+The virtual PD force of the `vobj` curriculum decays with the "mean training episode length" (fully on at 50 steps, off at 300). In the full run the episode length stays at 40–50 steps, so **the assist force is at full strength throughout training** (`assist/scale` ≈ 1.0) and the policy never has to move the object by itself; at evaluation the checkpoint's configuration also carries `object_assist`, so the object is pulled towards the reference pose even when not touched. `eval_tracking.py` now defaults to `HIPHI_WBT_NO_ASSIST=1`.
 
-`model_30499` 去掉辅助力后（第 0 帧起）：跑完 4/60（有辅助时 6/60），物体对 5.3%（7.8%），身体 55 mm、指尖 61 mm 基本不变。真正身体+物体都跟上的只剩 052（长凳，物体 15 mm，95%），050 物体对率从 53% 掉到 6%。
+`model_30499` without the assist force (from frame 0): 4/60 completed (6/60 with assist), object correct 5.3% (7.8%), body 55 mm and fingertip 61 mm essentially unchanged. The only sequence where both body and object truly track is 052 (bench, object 15 mm, 95%); the object-correct rate of 050 drops from 53% to 6%.
 
-结论：vobj 的衰减条件不对，应按迭代数衰减；需要用修复后的物体、不带 vobj（或按迭代衰减）重新训练。
+Conclusion: the decay condition of vobj is wrong and should decay by iteration count; retraining with the fixed objects and without vobj (or with per-iteration decay) is needed.
 
-## 6. 状态
+## 6. Status
 
-- 2026-10-09 `exp:g1-wuji-hiphi-wbt` 全量训练（2040 env，约 5.8 s/迭代，运行目录 `logs/HiPHI_WBT/20261009_124245-g1_wuji_hiphi_wbt-locomotion`）跑到 1402 次迭代后手动中断，转入快速迭代；奖励 −2.4 → 0.55，episode 长度 11 → 14 步，checkpoint `model_01000.pt`。
-- 2026-10-14 21:48 全量训练重启：`exp:g1-wuji-hiphi-wbt`，`HIPHI_WBT_SYNERGY=1 HIPHI_WBT_VARIANT=geo,contact`，2040 env，30000 次，7.6 s/迭代，tmux `wbt:train2`，日志 `wbt_logs/train_full2.log`，目录 `logs/HiPHI_WBT/20261014_194823-g1_wuji_hiphi_wbt_contact-geo_syn-locomotion`。AP（两段，+`vobj`）并行用于决定是否加课程。
-- 2026-10-09 15:05 三个并行快速实验（2 段：`000_Bringing-lug_0311`、`002_Cause_to_move_in_place-rock_0108`，1024 env，3000 次迭代，三个同时跑时各约 11 s/迭代）：A 基线、B `geo,contact`、C `geo,contact,future,bps,pen`（500 次迭代时三者无差别、episode 仅 11 步，C 于 18:50 停掉换成 D `geo,contact,vobj`），目录 `logs/HiPHI_WBT_fast/20261009_1505*`、`_1506*`，日志 `wbt_logs/fast_fast{A,B,C}.log`。
-- 对齐检查（`eval_tracking.py --zero-actions --dump-steps 12`）：第 0 步身体误差 8.5 mm、指尖 7.4 mm、手指关节 4.2°、物体 11.6 mm，说明动作数据、物体资产、env 原点和机器人初始化一致；零动作下机器人随后倒下属正常。
-- `model_00500`（迭代 500）逐段评测成功率 0（全部在 0.5 s 内被 bad-tracking 终止），这是训练早期的预期结果；holosoma 的 WBT 一般需要上万次迭代。后续按 `model_XXXXX.pt` 逐个评测。
-- `exp:g1-wuji-hiphi-wbt-fixhand`（手指纯回放，策略不控制手指）作为消融待跑（和主训练同时跑会把两者速度都减半，等主训练结束或有空闲 GPU 再跑）。
+- 2026-10-09 full training of `exp:g1-wuji-hiphi-wbt` (2040 env, about 5.8 s/iteration, run directory `logs/HiPHI_WBT/20261009_124245-g1_wuji_hiphi_wbt-locomotion`) was stopped manually after 1402 iterations and replaced by fast iteration; reward −2.4 → 0.55, episode length 11 → 14 steps, checkpoint `model_01000.pt`.
+- 2026-10-14 21:48 full training restarted: `exp:g1-wuji-hiphi-wbt`, `HIPHI_WBT_SYNERGY=1 HIPHI_WBT_VARIANT=geo,contact`, 2040 env, 30000 iterations, 7.6 s/iteration, tmux `wbt:train2`, log `wbt_logs/train_full2.log`, directory `logs/HiPHI_WBT/20261014_194823-g1_wuji_hiphi_wbt_contact-geo_syn-locomotion`. AP (two sequences, +`vobj`) runs in parallel to decide whether to add the curriculum.
+- 2026-10-09 15:05 three parallel fast experiments (2 sequences: `000_Bringing-lug_0311`, `002_Cause_to_move_in_place-rock_0108`, 1024 env, 3000 iterations, about 11 s/iteration each with all three running): A baseline, B `geo,contact`, C `geo,contact,future,bps,pen` (no difference among the three at 500 iterations, episodes only 11 steps; C stopped at 18:50 and replaced by D `geo,contact,vobj`), directories `logs/HiPHI_WBT_fast/20261009_1505*`, `_1506*`, logs `wbt_logs/fast_fast{A,B,C}.log`.
+- Alignment check (`eval_tracking.py --zero-actions --dump-steps 12`): step-0 body error 8.5 mm, fingertip 7.4 mm, finger joint 4.2°, object 11.6 mm, showing that motion data, object assets, env origins and robot initialization are consistent; the robot falling afterwards under zero actions is normal.
+- `model_00500` (iteration 500) per-sequence evaluation success rate 0 (all terminated by bad-tracking within 0.5 s), the expected result this early in training; holosoma's WBT usually needs tens of thousands of iterations. Later checkpoints are evaluated one by one as `model_XXXXX.pt`.
+- `exp:g1-wuji-hiphi-wbt-fixhand` (fingers pure replay, policy does not control the fingers) is pending as an ablation (running it alongside the main training halves the speed of both; wait for the main training to finish or for a free GPU).
