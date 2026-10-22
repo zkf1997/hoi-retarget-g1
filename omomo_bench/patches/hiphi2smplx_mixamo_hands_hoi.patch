@@ -1,0 +1,1700 @@
+diff --git a/README.md b/README.md
+index 755246d..b9a036c 100644
+--- a/README.md
++++ b/README.md
+@@ -140,3 +140,80 @@ We indicate externally borrowed code and model components here:
+ 
+ - Beta fitting is adapted from [joint2smpl](https://github.com/wangsen1312/joints2smpl) and [VIBE](https://github.com/mkocabas/VIBE).
+ - The SMPL-X body model and layer are provided by [SMPL-X](https://github.com/vchoutas/smplx).
++
++## Joint shape + hand fitting (`--fit-shape-hands`)
++
++SMPL-X has no separate hand shape space; hands share the body `shapedirs`.
++`--fit-shape-hands` replaces the first-frame, body-only beta fit with a joint
++optimisation of `--num-betas` shape coefficients (default 16) together with
++body and finger poses on `--shape-frames` frames spread over the clip (default
++8). Targets are the 22 body joints, the 30 HiPHI finger joints and the 10
++fingertip End Sites, so the fitted shape also respects hand proportions. It
++needs no SMPLify resources.
++
++```bash
++hiphi2smplx --input-bvh motion_actor.bvh --output motion_smplx.npz \
++  --model-path assets/models/SMPLX_NEUTRAL.npz \
++  --fit-shape-hands --num-betas 16 --beta-device cuda:0
++```
++
++The saved `betas` then has `--num-betas` entries.
++
++## Hand IK (`--fit-hands`)
++
++`--fit-hands` solves both wrists and all 30 finger joints right after the body
++IK with the same sequential Mink differential-IK approach (one 16-ball-joint
++chain per hand, warm-started from the previous frame). Targets are the HiPHI
++finger joints and fingertip End Sites: their bone *directions* are combined
++with the shaped SMPL-X bone lengths, and finger segments are chained from the
++current metacarpal ends, so the rigid SMPL-X palm never fights the BVH palm.
++Typical result: about 4 degrees mean bone-direction error, with the same
++temporal smoothness as the body IK; roughly 5 ms per frame for both hands.
++
++```bash
++hiphi2smplx --input-bvh motion_actor.bvh --output motion_smplx.npz \
++  --model-path assets/models/SMPLX_NEUTRAL.npz \
++  --fit-shape-hands --fit-hands --beta-device cuda:0
++```
++
++## Stage 2: HOI refinement (`hiphi2smplx-hoi`)
++
++`hiphi2smplx-hoi` refines a stage-1 result (body IK + `--fit-hands`) against
++the tracked object of a HiPHI HOI package. The correction is a *low-frequency*
++cubic B-spline in time (knots every `--basis-spacing` frames, default 9 =
++10 Hz) added to every stage-1 parameter, so it cannot introduce frame-to-frame
++jitter; all frames share one coefficient set optimised with Adam (cosine LR
++decay). Terms, on a libigl fast-winding-number SDF of the object mesh:
++
++- **penetration penalty**: SDF hinge with a 0.5 cm margin plus a normal-guided
++  term that pushes penetrating vertices back along their own body normal
++  (needed for thin chair seats and table tops);
++- **contact attraction**: BVH fingertips within 2 cm of the object (flags
++  majority-filtered in time) pull the distal-phalanx vertices onto the surface;
++  body vertices within a 2 cm band are attracted to the surface;
++- **anchors**: body joints to the stage-1 joints (`--w-joint-anchor`), finger
++  rotations to the stage-1 fingers (`--w-hand-prior`), plus the BVH finger
++  direction term.
++
++```bash
++hiphi2smplx-hoi \
++  --package /path/to/HiPHI/data/{frame}/{lu}/{motion_id} \
++  --stage1 /path/to/motion_smplx.npz \
++  --output /path/to/motion_smplx_hoi.npz \
++  --stats /path/to/motion_smplx_hoi.json \
++  --model-path assets/models/SMPLX_NEUTRAL.npz \
++  --repo-root /path/to/HiPHI --sdf-cache /path/to/sdf_cache \
++  --basis-spacing 9 --iters-full 120 --w-joint-anchor 0.3
++```
++
++The output keeps the AMASS-style layout and adds `tip_contact` with shape
++`(frames, 10)`: BVH-derived contact flags for left thumb..pinky, right
++thumb..pinky. The stats JSON reports penetration depth, frames penetrating
++more than 1 cm, fingertip-to-object distance on contact frames, hand bone
++direction error and joint acceleration (jitter), each before and after.
++Typical effect on HiPHI: frames penetrating >1 cm drop by 85 to 99 percent
++for boxes, tables and chair manipulation, fingertip contact distance drops to
++0.2 to 0.4 cm, and joint acceleration stays within 0.05 mm/frame^2 of stage 1.
++Seated motions are the exception: SMPL-X thighs are thicker than the actors',
++so removing seat penetration requires lifting the body several centimetres
++above the BVH joints, and the default anchor only partially does so.
+diff --git a/pyproject.toml b/pyproject.toml
+index fe9827f..ed31c68 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -26,6 +26,7 @@ dev = ["build", "ruff"]
+ 
+ [project.scripts]
+ hiphi2smplx = "hiphi2smplx.cli:main"
++hiphi2smplx-hoi = "hiphi2smplx.hoi_cli:main"
+ 
+ [tool.setuptools.packages.find]
+ where = ["src"]
+diff --git a/src/hiphi2smplx/cli.py b/src/hiphi2smplx/cli.py
+index 9a82393..9ffc8c2 100644
+--- a/src/hiphi2smplx/cli.py
++++ b/src/hiphi2smplx/cli.py
+@@ -9,6 +9,8 @@ from pathlib import Path
+ import numpy as np
+ 
+ from .beta_fitting import BetaFitConfig
++from .hand_ik import HandIkConfig
++from .shape_fitting import ShapeFitConfig
+ from .mano import ManoFitter
+ from .pipeline import ConversionConfig, fit_bvh, save_result
+ from .skeleton import SOURCE_SKELETON_MAPS
+@@ -38,8 +40,16 @@ def build_parser() -> argparse.ArgumentParser:
+     shape.add_argument(
+         "--fit-betas",
+         action="store_true",
+-        help="fit SMPL-X shape from the first BVH frame",
++        help="fit SMPL-X shape from the first BVH frame (body joints only, SMPLify priors)",
+     )
++    shape.add_argument(
++        "--fit-shape-hands",
++        action="store_true",
++        help="fit SMPL-X shape jointly with body and finger poses on several frames",
++    )
++    parser.add_argument("--num-betas", type=int, default=16)
++    parser.add_argument("--shape-frames", type=int, default=8)
++    parser.add_argument("--shape-iters", type=int, default=400)
+     parser.add_argument("--beta-iters", type=int, default=100)
+     parser.add_argument("--beta-step-size", type=float, default=1e-2)
+     parser.add_argument("--beta-device", default="cuda:0")
+@@ -51,6 +61,14 @@ def build_parser() -> argparse.ArgumentParser:
+             "defaults to packaged resources"
+         ),
+     )
++    parser.add_argument(
++        "--fit-hands",
++        action="store_true",
++        help="solve wrists and fingers with sequential Mink IK after the body IK",
++    )
++    parser.add_argument("--hand-iters", type=int, default=5)
++    parser.add_argument("--hand-posture-cost", type=float, default=0.002)
++    parser.add_argument("--hand-posture-reference", choices=("flat", "mean"), default="flat")
+     parser.add_argument("--max-frames", type=int)
+     parser.add_argument("--mink-iters", type=int, default=10)
+     parser.add_argument("--mink-dt", type=float, default=0.01)
+@@ -72,13 +90,13 @@ def build_parser() -> argparse.ArgumentParser:
+ 
+ 
+ def load_betas(path: Path) -> np.ndarray:
+-    """Load the first 10 finite shape coefficients from NPY or NPZ.
++    """Load the finite shape coefficients (>= 10) from NPY or NPZ.
+ 
+     Args:
+         path: NPY array or NPZ archive containing ``betas`` or ``beta``.
+ 
+     Returns:
+-        A copied float32 array with shape ``(10,)``.
++        A copied float32 array with shape ``(num_betas,)``.
+ 
+     Raises:
+         KeyError: If an NPZ archive has no beta field.
+@@ -95,7 +113,7 @@ def load_betas(path: Path) -> np.ndarray:
+     values = np.asarray(values, dtype=np.float32).reshape(-1)
+     if values.size < 10 or not np.isfinite(values).all():
+         raise ValueError(f"{path} must contain at least 10 finite beta coefficients")
+-    return values[:10].copy()
++    return values.copy()  # keep every coefficient (e.g. 16 from --fit-shape-hands); load_smplx_body applies all of them
+ 
+ 
+ def load_mano_fitter(spec: str | None) -> ManoFitter | None:
+@@ -163,6 +181,22 @@ def main(argv: list[str] | None = None) -> int:
+                 None if args.beta_fit_data is None else args.beta_fit_data.resolve()
+             ),
+         )
++    shape_fit_config = None
++    if args.fit_shape_hands:
++        shape_fit_config = ShapeFitConfig(
++            num_betas=args.num_betas,
++            num_frames=args.shape_frames,
++            iterations=args.shape_iters,
++            device=args.beta_device,
++        )
++    hand_ik_config = None
++    if args.fit_hands:
++        hand_ik_config = HandIkConfig(
++            iterations=args.hand_iters,
++            finger_posture_cost=args.hand_posture_cost,
++            solver=args.qp_solver,
++            posture_reference=args.hand_posture_reference,
++        )
+     mano_fitter = load_mano_fitter(args.mano_fitter)
+     config = ConversionConfig(
+         iterations=args.mink_iters,
+@@ -185,8 +219,17 @@ def main(argv: list[str] | None = None) -> int:
+         max_frames=args.max_frames,
+         skeleton_map=args.skeleton_map,
+         mano_fitter=mano_fitter,
++        shape_fit_config=shape_fit_config,
++        hand_ik_config=hand_ik_config,
+     )
+     save_result(output, result)
++    if result.hand_metadata and "bone_direction_error_deg" in result.hand_metadata:
++        e = result.hand_metadata["bone_direction_error_deg"]
++        print(f"hand IK: bone direction error L {e['left']:.1f} deg, R {e['right']:.1f} deg")
++    if result.shape_diagnostics is not None:
++        d = result.shape_diagnostics
++        print(f"shape fit: body err {d['body_error_cm']:.2f} cm, hand err "
++              f"{d['hand_error_cm_initial']:.2f}->{d['hand_error_cm']:.2f} cm")
+     print(f"saved {output}")
+     return 0
+ 
+diff --git a/src/hiphi2smplx/hand_ik.py b/src/hiphi2smplx/hand_ik.py
+new file mode 100644
+index 0000000..75a5885
+--- /dev/null
++++ b/src/hiphi2smplx/hand_ik.py
+@@ -0,0 +1,271 @@
++"""Sequential Mink differential IK for the SMPL-X hands (stage 1.5).
++
++After the 22-joint body IK, both hands are solved frame by frame with the same
++differential-IK machinery: a 16-ball-joint chain per hand (wrist + 15 finger
++joints) with one site per joint and one fingertip site per digit. Targets are
++rebuilt from the BVH finger *directions* with the shaped SMPL-X bone lengths,
++so bone-length mismatch between the HiPHI skeleton and SMPL-X cannot pull the
++chain apart. Each frame is warm-started from the previous solution, which
++gives temporally coherent finger motion without a batch smoothness term.
++"""
++
++from __future__ import annotations
++
++import xml.etree.ElementTree as ET
++from dataclasses import dataclass
++from pathlib import Path
++
++import numpy as np
++from scipy.spatial.transform import Rotation
++
++from .hoi_refine import DIGITS, _TIP_VERTEX, _hand_point_layout
++from .kinematics import local_to_global_rotations
++from .skeleton import SMPLX_BODY_PARENTS, SMPLX_JOINT_NAMES
++
++_WRIST = {"left": 20, "right": 21}
++_ELBOW = {"left": 18, "right": 19}
++
++
++@dataclass(frozen=True)
++class HandIkConfig:
++    """Settings for the sequential hand IK.
++
++    Attributes:
++        iterations: Differential-IK iterations per frame (warm-started).
++        dt: Mink integration step.
++        damping: Levenberg-Marquardt damping.
++        joint_cost: Position cost of the 15 finger-joint sites.
++        tip_cost: Position cost of the 5 fingertip sites.
++        palm_cost: Position cost of the 5 metacarpal-end (digit1) sites, which
++            only orient the rigid SMPL-X palm towards the BVH palm.
++        wrist_posture_cost: Pull of the wrist rotation towards the body-IK wrist.
++        finger_posture_cost: Pull of finger rotations towards the posture reference.
++        posture_reference: ``"flat"`` (zero rotations) or ``"mean"`` (SMPL-X/MANO
++            ``hands_mean``, a relaxed slightly curled hand).
++        solver: qpsolvers backend.
++    """
++
++    iterations: int = 5
++    dt: float = 0.01
++    damping: float = 1e-3
++    joint_cost: float = 1.0
++    tip_cost: float = 2.0
++    palm_cost: float = 0.3
++    wrist_posture_cost: float = 0.5
++    finger_posture_cost: float = 0.002
++    solver: str = "daqp"
++    posture_reference: str = "flat"
++
++
++def hands_mean(model_path: Path) -> dict[str, np.ndarray]:
++    """Return the SMPL-X/MANO mean finger poses per side with shape ``(15, 3)``."""
++    with np.load(model_path, allow_pickle=True) as m:
++        return {"left": np.asarray(m["hands_meanl"], dtype=np.float32).reshape(15, 3),
++                "right": np.asarray(m["hands_meanr"], dtype=np.float32).reshape(15, 3)}
++
++
++def shaped_rest(model_path: Path, betas: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++    """Return the shaped 55 rest joints and 10 fingertip vertices (metres)."""
++    with np.load(model_path, allow_pickle=True) as m:
++        v_template = np.asarray(m["v_template"], dtype=np.float64)
++        shapedirs = np.asarray(m["shapedirs"], dtype=np.float64)
++        regressor = m["J_regressor"]
++        if hasattr(regressor, "toarray"):
++            regressor = regressor.toarray()
++    b = np.asarray(betas, dtype=np.float64).reshape(-1)
++    v = v_template + np.einsum("vcn,n->vc", shapedirs[..., : b.size], b)
++    joints = np.asarray(regressor, dtype=np.float64) @ v
++    tips = np.asarray([[v[_TIP_VERTEX[s][d]] for d in DIGITS] for s in ("left", "right")]).reshape(10, 3)
++    return joints, tips
++
++
++def _hand_mjcf(side: str, rest_joints: np.ndarray, tips: np.ndarray) -> tuple[str, list[str], list[str]]:
++    """Build a 16-ball-joint hand model rooted at the wrist (wrist at the origin)."""
++    joint_ids, _, _ = _hand_point_layout(side)  # wrist + 15 finger joints (SMPL-X order)
++    names = [SMPLX_JOINT_NAMES[j] for j in joint_ids]
++    wrist = rest_joints[joint_ids[0]]
++    root = ET.Element("mujoco", model=f"hiphi2smplx_hand_{side}")
++    ET.SubElement(root, "compiler", angle="radian")
++    ET.SubElement(root, "option", gravity="0 0 0", timestep="1")
++    world = ET.SubElement(root, "worldbody")
++
++    def fmt(v):
++        return " ".join(f"{x:.6f}" for x in v)
++
++    def body(parent_node, name, offset):
++        b = ET.SubElement(parent_node, "body", name=name, pos=fmt(offset))
++        ET.SubElement(b, "inertial", pos="0 0 0", mass="0.001", diaginertia="0.000001 0.000001 0.000001")
++        ET.SubElement(b, "joint", name=f"{name}_joint", type="ball")
++        ET.SubElement(b, "site", name=f"{name}_site", pos="0 0 0", size="0.003")
++        return b
++
++    wrist_body = body(world, names[0], np.zeros(3))
++    tip_sites = []
++    side_index = 0 if side == "left" else 1
++    for k, digit in enumerate(DIGITS):
++        parent_node, parent_pos = wrist_body, wrist
++        for seg in (1, 2, 3):
++            name = f"{side}_{digit}{seg}"
++            pos = rest_joints[SMPLX_JOINT_NAMES.index(name)]
++            parent_node = body(parent_node, name, pos - parent_pos)
++            parent_pos = pos
++        tip_name = f"{side}_{digit}_tip"
++        ET.SubElement(parent_node, "site", name=f"{tip_name}_site", pos=fmt(tips[side_index * 5 + k] - parent_pos), size="0.003")
++        tip_sites.append(f"{tip_name}_site")
++    return ET.tostring(root, encoding="unicode"), names, tip_sites
++
++
++class MinkHandSolver:
++    """Sequential differential IK for one SMPL-X hand."""
++
++    def __init__(self, side: str, rest_joints: np.ndarray, tips: np.ndarray, config: HandIkConfig | None = None) -> None:
++        import mink
++        import mujoco as mj
++
++        self.mink, self.mj = mink, mj
++        self.cfg = HandIkConfig() if config is None else config
++        self.side = side
++        xml, self.joint_names, tip_sites = _hand_mjcf(side, rest_joints, tips)
++        self.model = mj.MjModel.from_xml_string(xml)
++        self.configuration = mink.Configuration(self.model)
++        self.joint_ids, _, bones = _hand_point_layout(side)
++        self.bones = np.asarray(bones)
++        # Shaped bone lengths of the 20 bones in the 21-point layout.
++        pts = np.concatenate([rest_joints[self.joint_ids], tips[0:5] if side == "left" else tips[5:10]])
++        self.bone_lengths = np.asarray([np.linalg.norm(pts[c] - pts[p]) for p, c in self.bones])
++        # 21 target points: wrist + 15 joints + 5 tips, matching _hand_point_layout.
++        site_names = [f"{n}_site" for n in self.joint_names] + tip_sites
++        self.site_ids = np.asarray([mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_SITE, s) for s in site_names])
++        digit1 = {f"{side}_{d}1" for d in DIGITS}
++        costs = [0.0] + [self.cfg.palm_cost if n in digit1 else self.cfg.joint_cost for n in self.joint_names[1:]] \
++            + [self.cfg.tip_cost] * 5
++        # bones grouped per digit: (wrist->d1, d1->d2, d2->d3, d3->tip)
++        self.digit_chains = [self.bones[4 * k: 4 * k + 4] for k in range(5)]
++        self.digit_lengths = [self.bone_lengths[4 * k: 4 * k + 4] for k in range(5)]
++        self.tasks = [
++            mink.FrameTask(frame_name=s, frame_type="site", position_cost=c, orientation_cost=0.0, lm_damping=self.cfg.damping)
++            for s, c in zip(site_names[1:], costs[1:], strict=True)
++        ]
++        posture = np.full(self.model.nv, self.cfg.finger_posture_cost)
++        posture[:3] = self.cfg.wrist_posture_cost
++        self.posture_task = mink.PostureTask(self.model, cost=posture, lm_damping=self.cfg.damping)
++        self.qpos_adr = np.asarray([
++            self.model.jnt_qposadr[mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_JOINT, f"{n}_joint")] for n in self.joint_names
++        ])
++
++    def _qpos(self, pose: np.ndarray) -> np.ndarray:
++        q = self.model.qpos0.copy()
++        quats = Rotation.from_rotvec(pose).as_quat(scalar_first=True)
++        for adr, quat in zip(self.qpos_adr, quats, strict=True):
++            q[adr:adr + 4] = quat
++        return q
++
++    def _pose(self, q: np.ndarray) -> np.ndarray:
++        return np.stack([Rotation.from_quat(q[a:a + 4], scalar_first=True).as_rotvec() for a in self.qpos_adr]).astype(np.float32)
++
++    def _directions(self, bvh_points_local: np.ndarray) -> np.ndarray:
++        """Unit BVH bone directions for the 20 bones (zero for degenerate bones)."""
++        d = bvh_points_local[self.bones[:, 1]] - bvh_points_local[self.bones[:, 0]]
++        n = np.linalg.norm(d, axis=-1, keepdims=True)
++        return np.where(n > 1e-8, d / np.maximum(n, 1e-8), 0.0)
++
++    def _targets(self, dirs: np.ndarray, current: np.ndarray) -> np.ndarray:
++        """Chain targets: palm ends from the wrist, finger segments from the current digit1."""
++        tgt = np.zeros((21, 3))
++        for k, (chain, lengths) in enumerate(zip(self.digit_chains, self.digit_lengths, strict=True)):
++            w, d1 = chain[0]
++            tgt[d1] = tgt[w] + lengths[0] * dirs[4 * k]
++            base = current[d1].copy()
++            for step, ((_, c), length) in enumerate(zip(chain[1:], lengths[1:], strict=True), start=1):
++                base = base + length * dirs[4 * k + step]
++                tgt[c] = base
++        return tgt
++
++    def solve(self, bvh_points_local: np.ndarray, init_pose: np.ndarray, reference_pose: np.ndarray) -> tuple[np.ndarray, float]:
++        """Solve one frame.
++
++        Args:
++            bvh_points_local: 21 BVH points (wrist, 15 joints, 5 tips) in the
++                wrist-parent (elbow) frame; only their bone directions are used.
++            init_pose: 16 axis-angle rotations (wrist first) for warm start.
++            reference_pose: Posture-task target (wrist from body IK, fingers flat).
++
++        Returns:
++            Solved 16 axis-angle rotations and the mean bone-direction error in radians.
++        """
++        dirs = self._directions(bvh_points_local)
++        self.configuration.update(q=self._qpos(init_pose))
++        self.posture_task.set_target(self._qpos(reference_pose))
++        for _ in range(self.cfg.iterations):
++            current = self.configuration.data.site_xpos[self.site_ids]
++            tgt = self._targets(dirs, current)
++            for task, t in zip(self.tasks, tgt[1:], strict=True):
++                task.set_target(self.mink.SE3.from_rotation_and_translation(self.mink.SO3.identity(), t))
++            v = self.mink.solve_ik(self.configuration, [*self.tasks, self.posture_task], self.cfg.dt, self.cfg.solver,
++                                   damping=self.cfg.damping, safety_break=False)
++            self.configuration.integrate_inplace(v, self.cfg.dt)
++            self.configuration.update()
++        pts = self.configuration.data.site_xpos[self.site_ids]
++        d = pts[self.bones[:, 1]] - pts[self.bones[:, 0]]
++        d /= np.maximum(np.linalg.norm(d, axis=-1, keepdims=True), 1e-8)
++        err = float(np.arccos(np.clip((d * dirs).sum(-1), -1.0, 1.0)).mean())
++        return self._pose(self.configuration.q), err
++
++
++def fit_hands(
++    body_poses: np.ndarray,
++    translations: np.ndarray,
++    body_joints: np.ndarray,
++    hand_targets: dict[str, np.ndarray],
++    betas: np.ndarray,
++    model_path: Path,
++    config: HandIkConfig | None = None,
++    progress: bool = False,
++) -> tuple[np.ndarray, dict[str, np.ndarray]]:
++    """Solve both hands for a whole clip.
++
++    Args:
++        body_poses: Stage-1 poses ``(F, 55, 3)``; wrist rotations are refined in place (copy).
++        translations: Stage-1 translations ``(F, 3)`` (unused except for API symmetry).
++        body_joints: Stage-1 fitted world body joints ``(F, 22, 3)``.
++        hand_targets: ``load_bvh_targets(...).hands``: side -> ``(F, 21, 3)`` world points.
++        betas: Shape used by the body IK.
++        model_path: SMPL-X NPZ.
++        config: Hand IK settings.
++        progress: Show a tqdm bar.
++
++    Returns:
++        Poses with wrists and fingers filled, and per-side per-frame mean bone-direction error (radians).
++    """
++    cfg = HandIkConfig() if config is None else config
++    poses = np.asarray(body_poses, dtype=np.float32).copy()
++    num_frames = len(poses)
++    rest, tips = shaped_rest(model_path, betas)
++    local = Rotation.from_rotvec(poses[:, :22].reshape(-1, 3)).as_matrix().reshape(num_frames, 22, 3, 3)
++    global_rot = local_to_global_rotations(local, SMPLX_BODY_PARENTS)  # (F, 22, 3, 3)
++    errors = {}
++    frames: object = range(num_frames)
++    if progress:
++        from tqdm import tqdm
++        frames = tqdm(frames, desc="mink-hands", leave=False)
++    solvers = {s: MinkHandSolver(s, rest, tips, cfg) for s in ("left", "right")}
++    if cfg.posture_reference == "mean":
++        finger_ref = hands_mean(model_path)
++    elif cfg.posture_reference == "flat":
++        finger_ref = {s: np.zeros((15, 3), np.float32) for s in solvers}
++    else:
++        raise ValueError("posture_reference must be 'flat' or 'mean'")
++    prev = {s: np.concatenate([poses[0, _WRIST[s]][None], finger_ref[s]]) for s in solvers}
++    err = {s: np.zeros(num_frames, np.float32) for s in solvers}
++    hand_slot = {"left": slice(25, 40), "right": slice(40, 55)}
++    for f in frames:
++        for s, solver in solvers.items():
++            r_elbow = global_rot[f, _ELBOW[s]]
++            wrist_world = body_joints[f, _WRIST[s]]
++            pts_local = (hand_targets[s][f] - wrist_world) @ r_elbow  # rows: R^T p
++            ref = np.concatenate([poses[f, _WRIST[s]][None], finger_ref[s]])
++            sol, err[s][f] = solver.solve(pts_local, prev[s], ref)
++            prev[s] = sol
++            poses[f, _WRIST[s]] = sol[0]
++            poses[f, hand_slot[s]] = sol[1:]
++    return poses, err
+diff --git a/src/hiphi2smplx/hoi_cli.py b/src/hiphi2smplx/hoi_cli.py
+new file mode 100644
+index 0000000..c72d289
+--- /dev/null
++++ b/src/hiphi2smplx/hoi_cli.py
+@@ -0,0 +1,48 @@
++"""Command-line entry point for stage-2 HOI refinement."""
++
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++
++from .hoi_refine import RefineConfig, refine_package
++
++
++def build_parser() -> argparse.ArgumentParser:
++    """Build the refinement CLI parser."""
++    p = argparse.ArgumentParser(description=__doc__)
++    p.add_argument("--package", type=Path, required=True, help="HiPHI motion package directory")
++    p.add_argument("--stage1", type=Path, required=True, help="stage-1 SMPL-X NPZ from hiphi2smplx")
++    p.add_argument("--output", type=Path, required=True)
++    p.add_argument("--model-path", type=Path, required=True)
++    p.add_argument("--repo-root", type=Path, required=True, help="HiPHI root containing object_meshes/")
++    p.add_argument("--sdf-cache", type=Path)
++    p.add_argument("--stats", type=Path, help="write refinement statistics JSON here")
++    p.add_argument("--device", default="cuda:0")
++    p.add_argument("--overwrite", action="store_true")
++    p.add_argument("--progress", action="store_true")
++    for name, default in RefineConfig.__dataclass_fields__.items():
++        kind = type(default.default)
++        p.add_argument(f"--{name.replace('_', '-')}", type=kind, default=default.default)
++    return p
++
++
++def main(argv: list[str] | None = None) -> int:
++    """Run one refinement."""
++    args = build_parser().parse_args(argv)
++    if args.output.exists() and not args.overwrite:
++        raise FileExistsError(f"{args.output} exists; pass --overwrite")
++    cfg = RefineConfig(**{k: getattr(args, k) for k in RefineConfig.__dataclass_fields__})
++    stats = refine_package(
++        args.package.resolve(), args.stage1.resolve(), args.model_path.resolve(), args.repo_root.resolve(),
++        args.output.resolve(), config=cfg, device=args.device, sdf_cache=args.sdf_cache,
++        stats_path=args.stats, progress=args.progress,
++    )
++    print(f"saved {args.output}  hand_dir_err {stats['hand_dir_error_deg_before']['mean']:.1f}->"
++          f"{stats['hand_dir_error_deg_after']['mean']:.1f} deg  "
++          f"pen {stats['penetration_cm_before']}->{stats['penetration_cm_after']}  {stats['seconds']:.0f}s")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/hiphi2smplx/hoi_refine.py b/src/hiphi2smplx/hoi_refine.py
+new file mode 100644
+index 0000000..718dfb4
+--- /dev/null
++++ b/src/hiphi2smplx/hoi_refine.py
+@@ -0,0 +1,774 @@
++"""Stage-2 HOI refinement: SMPL-X finger fitting plus object penetration/contact terms.
++
++The stage-1 pipeline (``fit_bvh``) solves the 22 body joints with Mink IK and
++leaves the fingers at zero. This module takes that result and, in batched GPU
++optimisation over sliding frame chunks, refines
++
++* both hands (SMPL-X ``left_hand_pose``/``right_hand_pose``) against the 30
++  HiPHI finger joints and 10 End-Site fingertips of the BVH,
++* body pose and translation, anchored to the stage-1 joints, so that a
++  signed-distance penetration penalty and a contact attraction term against
++  the tracked object mesh can be satisfied.
++
++The object mesh SDF is computed once per mesh with libigl (fast winding-number
++sign, robust for non-watertight OBJs) on a regular grid in object-local
++centimetres and sampled with trilinear interpolation.
++"""
++
++from __future__ import annotations
++
++import csv
++import json
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++from scipy.spatial.transform import Rotation
++
++from .bvh import load_bvh
++from .skeleton import BODY_SEMANTICS, HIPHI_MAP, SMPLX_JOINT_NAMES, SOURCE_SKELETON_MAPS, MotionClip
++
++# --------------------------------------------------------------------------- #
++# Constants
++# --------------------------------------------------------------------------- #
++
++DIGITS = ("thumb", "index", "middle", "ring", "pinky")
++_BVH_DIGIT = {"thumb": "Thumb", "index": "Index", "middle": "Middle", "ring": "Ring", "pinky": "Pinky"}
++_BVH_SIDE = {"left": "Left", "right": "Right"}
++_WRIST_INDEX = {"left": 20, "right": 21}
++# SMPL-X fingertip vertices (smplx.vertex_ids['smplx']).
++_TIP_VERTEX = {
++    "left": {"thumb": 5361, "index": 4933, "middle": 5058, "ring": 5169, "pinky": 5286},
++    "right": {"thumb": 8079, "index": 7669, "middle": 7794, "ring": 7905, "pinky": 8022},
++}
++_JOINT_INDEX = {name: i for i, name in enumerate(SMPLX_JOINT_NAMES)}
++
++
++def _hand_joint_names(side: str) -> list[str]:
++    """Return the 15 SMPL-X finger joint names of one side in SMPL-X order."""
++    return [n for n in SMPLX_JOINT_NAMES[25:55] if n.startswith(f"{side}_")]
++
++
++def _hand_point_layout(side: str) -> tuple[list[int], list[int], list[tuple[int, int]]]:
++    """Describe the 21-point hand layout: wrist, 15 joints, 5 tips.
++
++    Returns:
++        SMPL-X joint indices for points 0..15, tip vertex ids for points
++        16..20 (thumb, index, middle, ring, pinky), and the 20 (parent, child)
++        bone pairs inside the 21-point array.
++    """
++    names = _hand_joint_names(side)
++    joint_ids = [_WRIST_INDEX[side]] + [_JOINT_INDEX[n] for n in names]
++    tip_ids = [_TIP_VERTEX[side][d] for d in DIGITS]
++    local = {n: i + 1 for i, n in enumerate(names)}
++    bones = []
++    for k, d in enumerate(DIGITS):
++        chain = [0] + [local[f"{side}_{d}{s}"] for s in (1, 2, 3)] + [16 + k]
++        bones += list(zip(chain[:-1], chain[1:], strict=True))
++    return joint_ids, tip_ids, bones
++
++
++# --------------------------------------------------------------------------- #
++# BVH targets
++# --------------------------------------------------------------------------- #
++
++
++def _parse_end_sites(path: Path, unit_scale: float) -> dict[str, np.ndarray]:
++    """Return End Site offsets keyed by their parent joint name."""
++    sites: dict[str, np.ndarray] = {}
++    current = None
++    in_site = False
++    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
++        line = raw.strip()
++        if line == "MOTION":
++            break
++        if line.startswith(("ROOT ", "JOINT ")):
++            current = line.split(maxsplit=1)[1].strip()
++            in_site = False
++        elif line.startswith("End Site"):
++            in_site = True
++        elif line.startswith("OFFSET ") and in_site and current is not None:
++            sites[current] = np.asarray(line.split()[1:4], dtype=np.float32) * unit_scale
++            in_site = False
++    return sites
++
++
++@dataclass
++class BvhTargets:
++    """World-space BVH hand targets and body joints in metres."""
++
++    frame_time: float
++    body: np.ndarray  # (F, 22, 3)
++    hands: dict[str, np.ndarray]  # side -> (F, 21, 3): wrist, 15 joints, 5 tips
++    hand_scale: dict[str, float] = field(default_factory=dict)
++
++
++def load_bvh_targets(bvh_path: Path, clip: MotionClip | None = None, skeleton_map: str = "hiphi") -> BvhTargets:
++    """Compute world-space body/finger/tip positions from a HiPHI-style BVH (body joints via ``skeleton_map``)."""
++    body_map = SOURCE_SKELETON_MAPS[skeleton_map]
++    if clip is None:
++        clip = load_bvh(bvh_path, unit_scale=0.01)
++    positions, rotations = clip.world_transforms()
++    index = {n: i for i, n in enumerate(clip.skeleton.joint_names)}
++    sites = _parse_end_sites(bvh_path, 0.01)
++    body = positions[:, [index[body_map[s]] for s in BODY_SEMANTICS]]
++    hands = {}
++    for side in ("left", "right"):
++        pts = [positions[:, index[f"{_BVH_SIDE[side]}Hand"]]]
++        for n in _hand_joint_names(side):
++            digit, seg = n[len(side) + 1 : -1], n[-1]
++            pts.append(positions[:, index[f"{_BVH_SIDE[side]}Hand{_BVH_DIGIT[digit]}{seg}"]])
++        for d in DIGITS:
++            j = f"{_BVH_SIDE[side]}Hand{_BVH_DIGIT[d]}3"
++            off = sites.get(j)
++            if off is None:
++                raise ValueError(f"{bvh_path}: missing End Site under {j}")
++            pts.append(positions[:, index[j]] + np.einsum("fij,j->fi", rotations[:, index[j]], off))
++        hands[side] = np.stack(pts, axis=1).astype(np.float32)
++    return BvhTargets(float(clip.frame_time), body.astype(np.float32), hands)
++
++
++# --------------------------------------------------------------------------- #
++# Light SMPL-X layer on a vertex subset
++# --------------------------------------------------------------------------- #
++
++
++def _rodrigues(rv: torch.Tensor) -> torch.Tensor:
++    """Axis-angle ``(..., 3)`` to rotation matrices ``(..., 3, 3)``."""
++    angle = torch.norm(rv + 1e-9, dim=-1, keepdim=True)
++    axis = rv / angle
++    cos = torch.cos(angle)[..., None]
++    sin = torch.sin(angle)[..., None]
++    x, y, z = axis.unbind(-1)
++    zero = torch.zeros_like(x)
++    k = torch.stack([zero, -z, y, z, zero, -x, -y, x, zero], dim=-1).reshape(*rv.shape[:-1], 3, 3)
++    eye = torch.eye(3, device=rv.device, dtype=rv.dtype)
++    return eye + sin * k + (1.0 - cos) * (k @ k)
++
++
++class SmplxLite:
++    """Fixed-shape SMPL-X forward pass restricted to a vertex subset."""
++
++    def __init__(
++        self,
++        model_path: Path,
++        betas: np.ndarray,
++        vertex_ids: np.ndarray,
++        device: torch.device,
++    ) -> None:
++        with np.load(model_path, allow_pickle=True) as m:
++            v_template = np.asarray(m["v_template"], dtype=np.float64)
++            shapedirs = np.asarray(m["shapedirs"], dtype=np.float64)
++            posedirs = np.asarray(m["posedirs"], dtype=np.float64)
++            weights = np.asarray(m["weights"], dtype=np.float64)
++            regressor = m["J_regressor"]
++            if hasattr(regressor, "toarray"):
++                regressor = regressor.toarray()
++            parents = np.asarray(m["kintree_table"], dtype=np.int64)[0].copy()
++        parents[0] = -1
++        b = np.asarray(betas, dtype=np.float64).reshape(-1)
++        v_shaped = v_template + np.einsum("vcn,n->vc", shapedirs[..., : b.size], b)
++        joints = np.asarray(regressor, dtype=np.float64) @ v_shaped
++        self.num_joints = joints.shape[0]
++        self.parents = parents
++        self.vertex_ids = np.asarray(vertex_ids, dtype=np.int64)
++        self.device = device
++        dt = torch.float32
++        self.rest_joints = torch.as_tensor(joints, dtype=dt, device=device)
++        self.v_shaped = torch.as_tensor(v_shaped[self.vertex_ids], dtype=dt, device=device)
++        pd = posedirs[self.vertex_ids].reshape(-1, posedirs.shape[-1]).T  # (486, Vs*3)
++        self.posedirs = torch.as_tensor(np.ascontiguousarray(pd), dtype=dt, device=device)
++        self.weights = torch.as_tensor(weights[self.vertex_ids], dtype=dt, device=device)
++        self.weights_full = weights
++        rel = joints.copy()
++        rel[1:] -= joints[parents[1:]]
++        self.rel_joints = torch.as_tensor(rel, dtype=dt, device=device)
++        with np.load(model_path, allow_pickle=True) as m:
++            faces = np.asarray(m["f"], dtype=np.int64)
++        import trimesh
++
++        normals = trimesh.Trimesh(v_shaped, faces, process=False).vertex_normals
++        self.rest_normals = torch.as_tensor(np.asarray(normals)[self.vertex_ids], dtype=dt, device=device)
++
++    def forward(self, pose: torch.Tensor, trans: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        """Pose ``(B, 55, 3)`` axis-angle and ``(B, 3)`` translation to joints and subset verts."""
++        joints, verts, _ = self.forward_with_normals(pose, trans)
++        return joints, verts
++
++    def rigid_transforms(
++        self, pose: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++        """Return local rotations, global rotations, posed joints and skinning translations.
++
++        The skinning transform of joint ``j`` maps rest-pose vertices to posed
++        vertices as ``v' = g_rot[j] @ v + skin_t[j]`` (before the root translation).
++        """
++        batch = pose.shape[0]
++        rot = _rodrigues(pose)  # (B, 55, 3, 3)
++        rel = self.rel_joints
++        rots = [rot[:, 0]]
++        pos = [rel[0].expand(batch, 3)]
++        for j in range(1, self.num_joints):
++            parent = self.parents[j]
++            rots.append(rots[parent] @ rot[:, j])
++            pos.append(pos[parent] + (rots[parent] @ rel[j]))
++        g_rot = torch.stack(rots, dim=1)  # (B, J, 3, 3)
++        joints = torch.stack(pos, dim=1)  # (B, J, 3)
++        skin_t = joints - (g_rot @ self.rest_joints[None, :, :, None])[..., 0]  # (B, J, 3)
++        return rot, g_rot, joints, skin_t
++
++    def forward_with_normals(
++        self, pose: torch.Tensor, trans: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        """Like :meth:`forward` but also returns approximate posed vertex normals ``(B, Vs, 3)``."""
++        batch = pose.shape[0]
++        rot, g_rot, joints, skin_t = self.rigid_transforms(pose)
++        eye = torch.eye(3, device=pose.device, dtype=pose.dtype)
++        feature = (rot[:, 1:] - eye).reshape(batch, -1)
++        v_posed = self.v_shaped[None] + (feature @ self.posedirs).reshape(batch, -1, 3)
++
++        # Linear blend skinning as one GEMM: (Vs, J) @ (B, J, 12) -> (B, Vs, 12).
++        blend = torch.matmul(self.weights, torch.cat([g_rot.reshape(batch, self.num_joints, 9), skin_t], dim=-1))
++        v_rot = blend[..., :9].reshape(batch, -1, 3, 3)
++        verts = (v_rot * v_posed[..., None, :]).sum(-1) + blend[..., 9:]
++        normals = F.normalize((v_rot * self.rest_normals[None, :, None, :]).sum(-1), dim=-1)
++        return joints + trans[:, None], verts + trans[:, None], normals
++
++
++# --------------------------------------------------------------------------- #
++# Object SDF
++# --------------------------------------------------------------------------- #
++
++
++class ObjectSDF:
++    """Grid signed-distance field (centimetres, object-local) with trilinear sampling."""
++
++    def __init__(
++        self,
++        mesh_path: Path,
++        device: torch.device,
++        cache_dir: Path | None = None,
++        cell_cm: float = 1.0,
++        pad_cm: float = 15.0,
++        max_res: int = 224,
++    ) -> None:
++        cache = None if cache_dir is None else cache_dir / f"{mesh_path.stem}_sdf.npz"
++        if cache is not None and cache.exists():
++            with np.load(cache) as d:
++                origin, spacing, sdf = d["origin"], d["spacing"], d["sdf"]
++        else:
++            origin, spacing, sdf = self._compute(mesh_path, cell_cm, pad_cm, max_res)
++            if cache is not None:
++                cache.parent.mkdir(parents=True, exist_ok=True)
++                tmp = cache.with_suffix(".tmp.npz")
++                np.savez_compressed(tmp, origin=origin, spacing=spacing, sdf=sdf)
++                tmp.replace(cache)
++        self.origin = torch.as_tensor(origin, dtype=torch.float32, device=device)
++        self.extent = torch.as_tensor(spacing * (np.asarray(sdf.shape) - 1), dtype=torch.float32, device=device)
++        self.grid = torch.as_tensor(sdf, dtype=torch.float32, device=device)[None, None]
++        self.min_sdf = float(sdf.min())
++
++    @staticmethod
++    def _compute(mesh_path: Path, cell_cm: float, pad_cm: float, max_res: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++        import igl
++        import trimesh
++
++        mesh = trimesh.load(mesh_path, force="mesh", process=True, skip_materials=True)
++        mesh.merge_vertices(merge_tex=True, merge_norm=True)
++        verts = np.asarray(mesh.vertices, dtype=np.float64)
++        faces = np.asarray(mesh.faces, dtype=np.int64)
++        lo = verts.min(0) - pad_cm
++        hi = verts.max(0) + pad_cm
++        res = np.minimum(np.ceil((hi - lo) / cell_cm).astype(int) + 1, max_res)
++        axes = [np.linspace(lo[i], hi[i], res[i]) for i in range(3)]
++        spacing = np.asarray([(hi[i] - lo[i]) / (res[i] - 1) for i in range(3)])
++        query = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
++        sdf, _, _, _ = igl.signed_distance(query, verts, faces, igl.SIGNED_DISTANCE_TYPE_FAST_WINDING_NUMBER)
++        return lo.astype(np.float32), spacing.astype(np.float32), sdf.reshape(*res).astype(np.float32)
++
++    def query(self, points_cm: torch.Tensor) -> torch.Tensor:
++        """Sample the SDF at object-local points ``(..., 3)`` in centimetres."""
++        shape = points_cm.shape[:-1]
++        norm = (points_cm.reshape(-1, 3) - self.origin) / self.extent * 2.0 - 1.0
++        coords = norm[:, [2, 1, 0]].reshape(1, 1, 1, -1, 3)
++        out = F.grid_sample(self.grid, coords, mode="bilinear", padding_mode="border", align_corners=True)
++        return out.reshape(shape)
++
++
++@dataclass
++class TrackedObject:
++    """One object's SDF and per-frame world pose."""
++
++    object_id: str
++    category: str
++    sdf: ObjectSDF
++    position: torch.Tensor  # (F, 3) metres
++    rotation: torch.Tensor  # (F, 3, 3) local->world
++
++    def to_local_cm(self, points_world: torch.Tensor, frames: slice) -> torch.Tensor:
++        """World points ``(B, N, 3)`` in metres to object-local centimetres."""
++        rot = self.rotation[frames]
++        pos = self.position[frames]
++        return torch.einsum("bni,bij->bnj", points_world - pos[:, None], rot) * 100.0
++
++
++def load_objects(package: Path, repo_root: Path, device: torch.device, cache_dir: Path | None) -> list[TrackedObject]:
++    """Load every tracked object of one HiPHI package."""
++    meta = json.loads((package / "metadata.json").read_text())
++    objects = []
++    for obj in meta.get("objects", []):
++        rows = list(csv.DictReader((package / obj["trajectory_path"]).open()))
++        pos = np.asarray([[r["px"], r["py"], r["pz"]] for r in rows], dtype=np.float64)
++        quat = np.asarray([[r["qx"], r["qy"], r["qz"], r["qw"]] for r in rows], dtype=np.float64)
++        rot = Rotation.from_quat(quat).as_matrix()
++        objects.append(
++            TrackedObject(
++                object_id=obj["object_id"],
++                category=obj["object_category"],
++                sdf=ObjectSDF(repo_root / obj["mesh_path"], device, cache_dir),
++                position=torch.as_tensor(pos, dtype=torch.float32, device=device),
++                rotation=torch.as_tensor(rot, dtype=torch.float32, device=device),
++            )
++        )
++    return objects
++
++
++# --------------------------------------------------------------------------- #
++# Refinement
++# --------------------------------------------------------------------------- #
++
++
++@dataclass(frozen=True)
++class RefineConfig:
++    """Weights and schedule for stage-2 refinement (positions in cm, angles in rad).
++
++    ``body_mode`` limits which stage-1 parameters may be corrected: ``"arms"``
++    frees only shoulders, elbows, wrists and fingers (pelvis, spine, neck, head,
++    legs and the global translation stay exactly at stage 1); ``"all"`` frees
++    everything (needed when the torso/legs themselves interact with the object,
++    e.g. sitting); ``"auto"`` picks ``"all"`` when more than ``body_contact_frac``
++    of the frames show non-hand body vertices penetrating deeper than 1 cm.
++
++    The refinement optimises a *low-frequency correction* on top of the stage-1
++    parameters: every parameter delta is a cubic B-spline in time with knots
++    every ``basis_spacing`` frames (9 frames = 10 Hz at 90 Hz), so the
++    corrections cannot introduce frame-to-frame jitter by construction. All
++    chunks share one coefficient set (gradients are accumulated over chunks)
++    and Adam uses a cosine learning-rate decay to ``lr_final_ratio``.
++    Hands are initialised from the stage-1 poses (``--fit-hands``) and pulled
++    back to them by ``w_hand_prior``. ``w_corr_accel`` penalises the second time-difference of the correction (refined minus stage-1 joint positions, cm) so corrections vary slowly instead of oscillating with the contact state. ``w_accel`` optionally adds a second-
++    difference penalty on joint positions; ``contact_filter_frames``
++    majority-filters the BVH tip contact flags in time. ``iters_hand`` is kept
++    for CLI compatibility and ignored.
++    """
++
++    chunk: int = 2048
++    iters_hand: int = 0
++    iters_full: int = 120
++    lr_hand: float = 0.05
++    lr_full: float = 0.01
++    w_joint_anchor: float = 1.0
++    w_pose_prior: float = 1.0
++    body_mode: str = "auto"
++    body_contact_frac: float = 0.1
++    w_hand_dir: float = 50.0
++    w_hand_pos: float = 0.5
++    w_hand_prior: float = 1.0
++    w_hand_pca: float = 0.0
++    w_smooth_pose: float = 5.0
++    w_smooth_trans: float = 1.0
++    w_accel: float = 0.0
++    w_corr_accel: float = 0.0
++    contact_filter_frames: int = 9
++    basis_spacing: int = 9
++    lr_final_ratio: float = 0.05
++    w_pen: float = 1.0
++    w_pen_normal: float = 0.0
++    pen_margin_cm: float = 0.5
++    w_contact_tip: float = 0.5
++    w_contact_body: float = 0.1
++    contact_tip_cm: float = 2.0
++    contact_band_cm: float = 2.0
++    contact_target_cm: float = 0.3
++    body_subsample: int = 3
++
++
++def _select_vertices(weights: np.ndarray, body_subsample: int) -> tuple[np.ndarray, dict[str, Any]]:
++    """Choose the SMPL-X vertex subset: all hand vertices plus a body subsample."""
++    dominant = weights.argmax(axis=1)
++    hand_mask = (dominant >= 25) | (dominant == 20) | (dominant == 21)
++    body_ids = np.flatnonzero(~hand_mask)[::body_subsample]
++    ids = np.unique(np.concatenate([np.flatnonzero(hand_mask), body_ids, np.asarray(
++        [v for side in _TIP_VERTEX.values() for v in side.values()])]))
++    lookup = {v: i for i, v in enumerate(ids)}
++    info = {
++        "lookup": lookup,
++        "hand_mask": hand_mask[ids],
++        # vertices dominated by each distal phalanx joint, used for tip contact
++        "digit3": {
++            side: {d: np.asarray([lookup[v] for v in np.flatnonzero(dominant == _JOINT_INDEX[f"{side}_{d}3"])
++                                  if v in lookup]) for d in DIGITS}
++            for side in ("left", "right")
++        },
++    }
++    return ids, info
++
++
++def _accel(x: torch.Tensor, prev1: torch.Tensor | None, prev2: torch.Tensor | None) -> torch.Tensor:
++    """Sum of squared second differences, chained to the two previous frames when given."""
++    if prev1 is not None and prev2 is not None:
++        x = torch.cat([prev2[None], prev1[None], x], dim=0)
++    elif prev1 is not None:
++        x = torch.cat([prev1[None], x], dim=0)
++    return (x[2:] - 2 * x[1:-1] + x[:-2]).pow(2).sum()
++
++
++def _smooth(x: torch.Tensor, prev: torch.Tensor | None) -> torch.Tensor:
++    """Sum of squared frame-to-frame differences, optionally chained to a previous frame."""
++    diff = (x[1:] - x[:-1]).pow(2).sum()
++    if prev is not None:
++        diff = diff + (x[0] - prev).pow(2).sum()
++    return diff
++
++
++def _bspline_basis(num_frames: int, spacing: int, device: torch.device) -> torch.Tensor:
++    """Dense cubic B-spline design matrix ``(F, K)`` with uniform knots every ``spacing`` frames."""
++    from scipy.interpolate import BSpline
++
++    spacing = max(1, min(spacing, max(1, num_frames - 1)))
++    inner = np.arange(0, num_frames - 1 + spacing, spacing, dtype=np.float64)
++    inner[-1] = max(inner[-1], num_frames - 1)
++    knots = np.concatenate([[inner[0]] * 3, inner, [inner[-1]] * 3])
++    t = np.arange(num_frames, dtype=np.float64)
++    basis = BSpline.design_matrix(t, knots, 3).toarray()
++    return torch.as_tensor(basis, dtype=torch.float32, device=device)
++
++
++def refine_package(
++    package: Path,
++    stage1_npz: Path,
++    model_path: Path,
++    repo_root: Path,
++    output: Path,
++    *,
++    config: RefineConfig | None = None,
++    device: str = "cuda:0",
++    sdf_cache: Path | None = None,
++    stats_path: Path | None = None,
++    progress: bool = False,
++) -> dict[str, Any]:
++    """Refine one stage-1 SMPL-X motion with hand and object HOI terms (low-frequency correction)."""
++    cfg = RefineConfig() if config is None else config
++    dev = torch.device(device)
++    t_start = time.time()
++
++    with np.load(stage1_npz) as d:
++        poses0 = np.asarray(d["poses"], dtype=np.float32).reshape(-1, 55, 3)
++        trans0 = np.asarray(d["trans"], dtype=np.float32)
++        betas = np.asarray(d["betas"], dtype=np.float32)
++        framerate = float(d["mocap_framerate"])
++    targets = load_bvh_targets(package / "motion_actor.bvh")
++    num_frames = min(len(poses0), len(targets.body))
++    poses0, trans0 = poses0[:num_frames], trans0[:num_frames]
++
++    with np.load(model_path, allow_pickle=True) as m:
++        weights_full = np.asarray(m["weights"])
++    vertex_ids, vinfo = _select_vertices(weights_full, cfg.body_subsample)
++    model = SmplxLite(model_path, betas, vertex_ids, dev)
++    objects = load_objects(package, repo_root, dev, sdf_cache)
++    for obj in objects:
++        if len(obj.position) < num_frames:
++            raise ValueError(f"{obj.object_id}: trajectory shorter than motion")
++
++    layouts = {s: _hand_point_layout(s) for s in ("left", "right")}
++    tip_rows = {s: torch.as_tensor([vinfo["lookup"][v] for v in layouts[s][1]], device=dev) for s in layouts}
++    hand_rows = {s: torch.as_tensor(layouts[s][0], device=dev) for s in layouts}
++    bones = {s: torch.as_tensor(layouts[s][2], device=dev) for s in layouts}
++    hand_targets = {s: torch.as_tensor(targets.hands[s][:num_frames], device=dev) for s in layouts}
++
++    with torch.no_grad():
++        rest_joints, rest_verts = model.forward(torch.zeros(1, 55, 3, device=dev), torch.zeros(1, 3, device=dev))
++        hand_scale = {}
++        for s in layouts:
++            pts = torch.cat([rest_joints[0, hand_rows[s]], rest_verts[0, tip_rows[s]]], 0)
++            b = bones[s]
++            len_s = (pts[b[:, 1]] - pts[b[:, 0]]).norm(dim=-1).sum()
++            tb = hand_targets[s][0]
++            len_b = (tb[b[:, 1]] - tb[b[:, 0]]).norm(dim=-1).sum()
++            hand_scale[s] = float(len_s / len_b)
++
++    # BVH-driven fingertip contact flags, majority-filtered in time.
++    tip_contact = {s: torch.zeros(num_frames, 5, dtype=torch.bool, device=dev) for s in layouts}
++    if objects:
++        with torch.no_grad():
++            for s in layouts:
++                tips = hand_targets[s][:, 16:21]
++                for obj in objects:
++                    local = obj.to_local_cm(tips, slice(0, num_frames))
++                    tip_contact[s] |= obj.sdf.query(local).abs() < cfg.contact_tip_cm
++        if cfg.contact_filter_frames > 1:
++            k = cfg.contact_filter_frames
++            for s in layouts:
++                x = tip_contact[s].float().T[None]
++                avg = F.avg_pool1d(F.pad(x, (k // 2, k // 2), mode="replicate"), k, stride=1)
++                tip_contact[s] = avg[0].T > 0.5
++    digit3_rows = {s: [torch.as_tensor(vinfo["digit3"][s][d], device=dev) for d in DIGITS] for s in layouts}
++
++    # Stage-1 parameters (constants) and the low-frequency correction coefficients.
++    orient0 = torch.as_tensor(poses0[:, 0], device=dev)
++    body0 = torch.as_tensor(poses0[:, 1:22].reshape(num_frames, 63), device=dev)
++    lhand0 = torch.as_tensor(poses0[:, 25:40].reshape(num_frames, 45), device=dev)
++    rhand0 = torch.as_tensor(poses0[:, 40:55].reshape(num_frames, 45), device=dev)
++    trans0_t = torch.as_tensor(trans0, device=dev)
++    # MANO PCA (rows orthogonal, row norm = component std; training coefficients are whitened):
++    # whitened coefficients c = (pose - mean) @ B^T / |B_k|^2, Mahalanobis distance = |c|^2.
++    with np.load(model_path, allow_pickle=True) as m:
++        pca = {}
++        for s_, suffix in (("left", "l"), ("right", "r")):
++            comps = np.asarray(m[f"hands_components{suffix}"], dtype=np.float64)
++            proj = comps.T / (np.linalg.norm(comps, axis=1) ** 2)[None]  # (45, 45): h @ proj -> c
++            pca[s_] = (torch.as_tensor(np.asarray(m[f"hands_mean{suffix}"], dtype=np.float32), device=dev),
++                       torch.as_tensor(proj.astype(np.float32), device=dev))
++    basis = _bspline_basis(num_frames, cfg.basis_spacing, dev)  # (F, K)
++    num_coeff = basis.shape[1]
++    slots = {"orient": (0, 3), "body": (3, 66), "lhand": (66, 111), "rhand": (111, 156), "trans": (156, 159)}
++    coeff = torch.zeros(num_coeff, 159, device=dev, requires_grad=True)
++    param_mask = torch.ones(159, device=dev)  # which stage-1 parameters may receive a correction
++
++    def set_body_mode(mode: str):
++        param_mask.fill_(1.0)
++        if mode == "arms":
++            param_mask[0:3] = 0.0  # global orientation
++            param_mask[156:159] = 0.0  # translation
++            free_body = {16, 17, 18, 19, 20, 21}  # shoulders, elbows, wrists (SMPL-X joint ids)
++            for j in range(1, 22):
++                if j not in free_body:
++                    param_mask[3 + 3 * (j - 1): 3 + 3 * j] = 0.0
++        elif mode != "all":
++            raise ValueError("body_mode must be 'auto', 'arms' or 'all'")
++
++    def current(frames: slice):
++        delta = (basis[frames] @ coeff) * param_mask  # (n, 159)
++        o = orient0[frames] + delta[:, 0:3]
++        b = body0[frames] + delta[:, 3:66]
++        lh = lhand0[frames] + delta[:, 66:111]
++        rh = rhand0[frames] + delta[:, 111:156]
++        t = trans0_t[frames] + delta[:, 156:159]
++        n = o.shape[0]
++        pose = torch.cat([o[:, None], b.reshape(n, 21, 3), torch.zeros(n, 3, 3, device=dev),
++                          lh.reshape(n, 15, 3), rh.reshape(n, 15, 3)], dim=1)
++        return pose, t, (o, b, lh, rh)
++
++    chunks = [slice(s0, min(s0 + cfg.chunk, num_frames)) for s0 in range(0, num_frames, cfg.chunk)]
++
++    with torch.no_grad():
++        anchor = torch.empty(num_frames, 22, 3, device=dev)
++        for fr in chunks:
++            pose, t, _ = current(fr)
++            anchor[fr] = model.forward(pose, t)[0][:, :22]
++
++    def hand_terms(joints, verts, lh, rh, frames):
++        n = joints.shape[0]
++        loss_dir = joints.new_zeros(())
++        loss_pos = joints.new_zeros(())
++        for s in layouts:
++            pts = torch.cat([joints[:, hand_rows[s]], verts[:, tip_rows[s]]], 1)
++            tgt = hand_targets[s][frames]
++            b = bones[s]
++            u_s = F.normalize(pts[:, b[:, 1]] - pts[:, b[:, 0]], dim=-1)
++            u_t = F.normalize(tgt[:, b[:, 1]] - tgt[:, b[:, 0]], dim=-1)
++            loss_dir = loss_dir + (u_s - u_t).pow(2).sum(-1).sum(-1).sum()
++            rel_s = (pts[:, 1:] - pts[:, :1]) * 100.0
++            rel_t = (tgt[:, 1:] - tgt[:, :1]) * 100.0 * hand_scale[s]
++            loss_pos = loss_pos + (rel_s - rel_t).pow(2).sum(-1).sum()
++        prior = (lh - lhand0[frames]).pow(2).sum() + (rh - rhand0[frames]).pow(2).sum()
++        loss = cfg.w_hand_dir * loss_dir + cfg.w_hand_pos * loss_pos + cfg.w_hand_prior * prior
++        if cfg.w_hand_pca > 0:
++            for h, side in ((lh, "left"), (rh, "right")):
++                mean, proj = pca[side]
++                loss = loss + cfg.w_hand_pca * ((h - mean) @ proj).pow(2).sum()
++        return loss
++
++    def object_terms(verts, frames, normals=None):
++        """Penetration penalty and contact attraction (summed over frames); returns (loss, max depth)."""
++        loss = verts.new_zeros(())
++        depth = verts.new_zeros(verts.shape[0])
++        for oi, obj in enumerate(objects):
++            local = obj.to_local_cm(verts, frames)
++            sdf = obj.sdf.query(local)
++            pen = F.relu(cfg.pen_margin_cm - sdf)
++            loss = loss + cfg.w_pen * pen.pow(2).sum()
++            depth = torch.maximum(depth, F.relu(-sdf).max(dim=1).values)
++            if normals is not None and cfg.w_pen_normal > 0:
++                with torch.no_grad():
++                    weight = F.relu(cfg.pen_margin_cm - sdf)
++                    n_local = torch.einsum("bni,bij->bnj", normals, obj.rotation[frames])
++                loss = loss + cfg.w_pen_normal * (weight * (local * n_local).sum(-1)).sum()
++            # body contact: vertices currently within the band are pulled onto the surface
++            # (the B-spline parametrisation already prevents frame-to-frame flicker)
++            with torch.no_grad():
++                band = (sdf > 0) & (sdf < cfg.contact_band_cm)
++            loss = loss + cfg.w_contact_body * (sdf * band).pow(2).sum()
++            for s in layouts:
++                flags = tip_contact[s][frames]
++                for k in range(5):
++                    rows = digit3_rows[s][k]
++                    if rows.numel() == 0 or not flags[:, k].any():
++                        continue
++                    d = sdf[:, rows][flags[:, k]]
++                    loss = loss + cfg.w_contact_tip * F.relu(d - cfg.contact_target_cm).pow(2).sum()
++        return loss, depth
++
++    def hand_dir_error(joints, verts, frames):
++        errs = []
++        for s in layouts:
++            pts = torch.cat([joints[:, hand_rows[s]], verts[:, tip_rows[s]]], 1)
++            tgt = hand_targets[s][frames]
++            b = bones[s]
++            u_s = F.normalize(pts[:, b[:, 1]] - pts[:, b[:, 0]], dim=-1)
++            u_t = F.normalize(tgt[:, b[:, 1]] - tgt[:, b[:, 0]], dim=-1)
++            errs.append(torch.rad2deg(torch.acos((u_s * u_t).sum(-1).clamp(-1, 1))).mean(1))
++        return torch.stack(errs, 1).mean(1)
++
++    def tip_distance(verts, frames):
++        if not objects:
++            return verts.new_full((verts.shape[0],), float("nan"))
++        out = verts.new_zeros(verts.shape[0])
++        cnt = verts.new_zeros(verts.shape[0])
++        for obj in objects:
++            sdf = obj.sdf.query(obj.to_local_cm(verts, frames))
++            for s in layouts:
++                flags = tip_contact[s][frames].float()
++                out = out + (sdf[:, tip_rows[s]].abs() * flags).sum(1)
++                cnt = cnt + flags.sum(1)
++        return torch.where(cnt > 0, out / cnt.clamp(min=1), verts.new_full((verts.shape[0],), float("nan")))
++
++    def all_points(joints, verts):
++        return torch.cat([joints[:, :22], joints[:, 25:55], verts[:, tip_rows["left"]], verts[:, tip_rows["right"]]], 1)
++
++    body_rows = torch.as_tensor(np.flatnonzero(~vinfo["hand_mask"]), device=dev)
++
++    def body_depth(verts, frames):
++        """Max penetration depth (cm) per frame over non-hand vertices."""
++        depth = verts.new_zeros(verts.shape[0])
++        for obj in objects:
++            sdf = obj.sdf.query(obj.to_local_cm(verts[:, body_rows], frames))
++            depth = torch.maximum(depth, F.relu(-sdf).max(dim=1).values)
++        return depth
++
++    def evaluate():
++        """No-grad diagnostics over the whole clip."""
++        dirs, depths, bdepths, tipd, pts = [], [], [], [], []
++        with torch.no_grad():
++            for fr in chunks:
++                pose, t, _ = current(fr)
++                j, v = model.forward(pose, t)
++                dirs.append(hand_dir_error(j, v, fr))
++                pts.append(all_points(j, v))
++                if objects:
++                    depths.append(object_terms(v, fr)[1])
++                    bdepths.append(body_depth(v, fr))
++                    tipd.append(tip_distance(v, fr))
++        p = torch.cat(pts) * 1000.0
++        accel = (p[2:] - 2 * p[1:-1] + p[:-2]).norm(dim=-1).mean(1)
++        return {"dir": torch.cat(dirs), "depth": torch.cat(depths) if depths else None,
++                "body_depth": torch.cat(bdepths) if bdepths else None,
++                "tipd": torch.cat(tipd) if tipd else None, "accel": accel, "points": torch.cat(pts)}
++
++    before = evaluate()
++    body_mode = cfg.body_mode
++    if body_mode == "auto":
++        frac = float((before["body_depth"] > 1.0).float().mean()) if before["body_depth"] is not None else 0.0
++        body_mode = "all" if frac > cfg.body_contact_frac else "arms"
++    set_body_mode(body_mode)
++
++    opt = torch.optim.Adam([coeff], lr=cfg.lr_full)
++    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, cfg.iters_full, eta_min=cfg.lr_full * cfg.lr_final_ratio)
++    iterator: Any = range(cfg.iters_full)
++    if progress:
++        from tqdm import tqdm
++        iterator = tqdm(iterator, desc="hoi-refine", leave=False)
++    for _ in iterator:
++        opt.zero_grad(set_to_none=True)
++        for fr in chunks:
++            pose, t, (o, b, lh, rh) = current(fr)
++            j, v, nrm = model.forward_with_normals(pose, t)
++            loss = hand_terms(j, v, lh, rh, fr)
++            loss = loss + cfg.w_joint_anchor * ((j[:, :22] - anchor[fr]) * 100.0).pow(2).sum(-1).sum()
++            loss = loss + cfg.w_pose_prior * ((b - body0[fr]).pow(2).sum() + (o - orient0[fr]).pow(2).sum())
++            if cfg.w_accel > 0:
++                loss = loss + cfg.w_accel * _accel(all_points(j, v) * 100.0, None, None)
++            if cfg.w_corr_accel > 0:
++                corr_pts = (all_points(j, v) - before["points"][fr]) * 100.0
++                loss = loss + cfg.w_corr_accel * _accel(corr_pts, None, None)
++            if objects:
++                loss = loss + object_terms(v, fr, nrm)[0]
++            (loss / num_frames).backward()
++        opt.step()
++        sched.step()
++
++    after = evaluate()
++    with torch.no_grad():
++        poses = torch.cat([current(fr)[0] for fr in chunks]).cpu().numpy().reshape(num_frames, 165)
++        trans_np = torch.cat([current(fr)[1] for fr in chunks]).cpu().numpy()
++
++    output.parent.mkdir(parents=True, exist_ok=True)
++    tmp = output.with_name(f".{output.name}.tmp.npz")
++    np.savez_compressed(
++        tmp,
++        poses=poses.astype(np.float32),
++        trans=trans_np.astype(np.float32),
++        betas=betas,
++        gender=np.asarray("neutral"),
++        mocap_framerate=np.asarray(framerate, dtype=np.float32),
++        tip_contact=torch.cat([tip_contact["left"], tip_contact["right"]], 1).cpu().numpy(),
++    )
++    tmp.replace(output)
++
++    def summary(x):
++        if x is None:
++            return None
++        x = x.cpu().numpy()
++        return {"mean": float(x.mean()), "max": float(x.max()), "p95": float(np.percentile(x, 95))}
++
++    def nanmean(x):
++        return None if x is None else float(np.nanmean(x.cpu().numpy()))
++
++    dev_cm = (after["points"] - before["points"]).norm(dim=-1) * 100.0  # (F, 62) joints+fingers+tips
++    groups = {"head": [15], "neck": [12], "spine": [3, 6, 9], "pelvis": [0], "legs": [1, 2, 4, 5, 7, 8],
++              "shoulders": [16, 17], "elbows": [18, 19], "wrists": [20, 21],
++              "fingers": list(range(22, 52)), "tips": list(range(52, 62))}
++    deviation = {k: {"mean": float(dev_cm[:, idx].mean()), "max": float(dev_cm[:, idx].max())} for k, idx in groups.items()}
++    corr = (after["points"] - before["points"]) * 1000.0
++    corr_speed = (corr[1:] - corr[:-1]).norm(dim=-1).max(dim=1).values  # mm per frame, max over points
++    stats: dict[str, Any] = {
++        "frames": num_frames,
++        "body_mode": body_mode,
++        "body_contact_frame_frac_before": float((before["body_depth"] > 1.0).float().mean()) if before["body_depth"] is not None else 0.0,
++        "deviation_cm": deviation,
++        "correction_speed_mm_per_frame": {"max": float(corr_speed.max()), "p99": float(np.percentile(corr_speed.cpu().numpy(), 99))},
++        "objects": [o.object_id for o in objects],
++        "hand_scale": hand_scale,
++        "basis_coefficients": int(num_coeff),
++        "tip_contact_frames": {s: int(tip_contact[s].any(1).sum()) for s in layouts},
++        "hand_dir_error_deg_before": summary(before["dir"]),
++        "hand_dir_error_deg_after": summary(after["dir"]),
++        "penetration_cm_before": summary(before["depth"]),
++        "penetration_cm_after": summary(after["depth"]),
++        "frames_penetrating_gt_1cm_before": int((before["depth"] > 1.0).sum()) if before["depth"] is not None else 0,
++        "frames_penetrating_gt_1cm_after": int((after["depth"] > 1.0).sum()) if after["depth"] is not None else 0,
++        "tip_contact_distance_cm_before": nanmean(before["tipd"]),
++        "tip_contact_distance_cm_after": nanmean(after["tipd"]),
++        "joint_accel_mm_before": summary(before["accel"]),
++        "joint_accel_mm_after": summary(after["accel"]),
++        "body_drift_cm_mean": float(np.linalg.norm(trans_np - trans0, axis=-1).mean() * 100.0),
++        "seconds": time.time() - t_start,
++    }
++    if stats_path is not None:
++        stats_path.parent.mkdir(parents=True, exist_ok=True)
++        stats_path.write_text(json.dumps(stats, indent=1))
++    return stats
+diff --git a/src/hiphi2smplx/pipeline.py b/src/hiphi2smplx/pipeline.py
+index a4336f4..004172a 100644
+--- a/src/hiphi2smplx/pipeline.py
++++ b/src/hiphi2smplx/pipeline.py
+@@ -17,6 +17,9 @@ from .ik_solver import (
+     prepare_body_inputs,
+ )
+ from .mano import ManoFitter, ManoFittingInput, merge_mano_result
++from .hand_ik import HandIkConfig, fit_hands
++from .hoi_refine import load_bvh_targets
++from .shape_fitting import ShapeFitConfig, fit_shape_and_hands
+ from .skeleton import map_skeleton
+ from .smplx import load_smplx_body, pack_body_pose
+ 
+@@ -73,6 +76,7 @@ class MotionResult:
+     final_losses: np.ndarray
+     frame_time: float
+     hand_metadata: dict[str, Any] | None = None
++    shape_diagnostics: dict[str, Any] | None = None
+ 
+ 
+ def fit_bvh(
+@@ -85,6 +89,8 @@ def fit_bvh(
+     max_frames: int | None = None,
+     skeleton_map: str = "hiphi",
+     mano_fitter: ManoFitter | None = None,
++    shape_fit_config: ShapeFitConfig | None = None,
++    hand_ik_config: HandIkConfig | None = None,
+ ) -> MotionResult:
+     """Convert one HiPHI BVH file to fixed-shape SMPL-X parameters.
+ 
+@@ -99,6 +105,9 @@ def fit_bvh(
+         max_frames: Optional limit on the number of leading frames.
+         skeleton_map: Registered exact source-skeleton mapping.
+         mano_fitter: Optional external hand-fitting implementation.
++        shape_fit_config: Joint shape + finger fit replacing ``beta_fit_config``.
++        hand_ik_config: When given, solve wrists and fingers with sequential
++            Mink IK after the body (stage 1.5); mutually exclusive with ``mano_fitter``.
+ 
+     Returns:
+         Converted poses, translations, shape, timing, and fitting diagnostics.
+@@ -116,19 +125,45 @@ def fit_bvh(
+         raise FileNotFoundError(model_path)
+     if max_frames is not None and max_frames < 1:
+         raise ValueError("max_frames must be positive")
+-    if (betas is None) == (beta_fit_config is None):
+-        raise ValueError("provide exactly one of betas or beta_fit_config")
++    if sum(x is not None for x in (betas, beta_fit_config, shape_fit_config)) != 1:
++        raise ValueError("provide exactly one of betas, beta_fit_config or shape_fit_config")
+ 
+     source = load_bvh(source_path, unit_scale=0.01)
+     if max_frames is not None:
+         source = source.sliced(min(source.num_frames, max_frames))
+     source_mapping = map_skeleton(source.skeleton, skeleton_map)
+ 
+-    if beta_fit_config is None:
++    shape_diagnostics: dict[str, Any] | None = None
++    if betas is not None:
+         beta = np.asarray(betas, dtype=np.float32).reshape(-1)
+         if beta.size < 10 or not np.isfinite(beta).all():
+             raise ValueError("betas must contain at least 10 finite coefficients")
+-        beta = beta[:10].copy()
++        beta = beta.copy()
++        smplx_body = load_smplx_body(model_path, beta)
++    elif shape_fit_config is not None:
++        neutral_body = load_smplx_body(model_path, np.zeros(10, dtype=np.float32))
++        neutral_targets, neutral_reference = prepare_body_inputs(
++            source,
++            source_mapping,
++            neutral_body.skeleton,
++        )
++        shape_result = fit_shape_and_hands(
++            source,
++            source_path,
++            neutral_targets,
++            neutral_reference,
++            neutral_body.rest_joints,
++            model_path,
++            shape_fit_config,
++            skeleton_map=skeleton_map,
++        )
++        beta = shape_result.betas
++        shape_diagnostics = {
++            "body_error_cm": shape_result.body_error_cm,
++            "hand_error_cm": shape_result.hand_error_cm,
++            "hand_error_cm_initial": shape_result.hand_error_cm_initial,
++            "hand_bone_ratio": shape_result.hand_bone_ratio.tolist(),
++        }
+         smplx_body = load_smplx_body(model_path, beta)
+     else:
+         neutral_body = load_smplx_body(model_path, np.zeros(10, dtype=np.float32))
+@@ -204,6 +239,26 @@ def fit_bvh(
+ 
+     poses = pack_body_pose(body_pose)
+     hand_metadata = None
++    if hand_ik_config is not None:
++        if mano_fitter is not None:
++            raise ValueError("hand_ik_config and mano_fitter are mutually exclusive")
++        hand_targets = load_bvh_targets(source_path, clip=source, skeleton_map=skeleton_map).hands
++        poses, hand_errors = fit_hands(
++            poses,
++            translations,
++            fitted,
++            hand_targets,
++            beta,
++            model_path,
++            hand_ik_config,
++            progress=config.progress,
++        )
++        hand_metadata = {
++            "method": "mink-hand-ik",
++            "bone_direction_error_deg": {
++                side: float(np.degrees(values.mean())) for side, values in hand_errors.items()
++            },
++        }
+     if mano_fitter is not None:
+         hand_result = mano_fitter.fit(
+             ManoFittingInput(
+@@ -227,6 +282,7 @@ def fit_bvh(
+         final_losses=losses,
+         frame_time=float(source.frame_time),
+         hand_metadata=hand_metadata,
++        shape_diagnostics=shape_diagnostics,
+     )
+ 
+ 
+diff --git a/src/hiphi2smplx/shape_fitting.py b/src/hiphi2smplx/shape_fitting.py
+new file mode 100644
+index 0000000..0f28325
+--- /dev/null
++++ b/src/hiphi2smplx/shape_fitting.py
+@@ -0,0 +1,228 @@
++"""Joint SMPL-X shape, body-pose and finger-pose fitting on a few BVH frames.
++
++SMPL-X has no separate hand shape space: hands share the unified ``shapedirs``
++basis with the body. To make the fitted shape respect the actor's hands, this
++module fits ``num_betas`` shape coefficients together with per-frame body and
++finger poses against the 22 body joints, the 30 finger joints and the 10
++fingertip End Sites of several frames spread over the clip. Unlike
++``beta_fitting`` it needs no SMPLify resources: body poses are initialised from
++the BVH rotations and regularised towards them.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++
++from .beta_fitting import _prepare_target_joints
++from .hoi_refine import DIGITS, _hand_point_layout, _rodrigues, load_bvh_targets
++from .skeleton import MotionClip
++
++
++@dataclass(frozen=True)
++class ShapeFitConfig:
++    """Settings for joint shape + hand fitting (positions in cm, angles in rad).
++
++    Attributes:
++        num_betas: Number of SMPL-X shape coefficients to fit (max 300).
++        num_frames: Frames spread evenly over the clip used for the fit.
++        iterations: Adam iterations.
++        lr: Adam learning rate.
++        device: Torch device.
++        w_body: Weight of the squared 22-joint position error.
++        w_hand: Weight of the squared finger joint / fingertip position error.
++        w_hand_dir: Weight of the finger bone direction error.
++        w_shape_prior: L2 prior on the first 10 shape coefficients.
++        w_shape_prior_extra: L2 prior on coefficients beyond the first 10.
++        w_pose_prior: L2 pull of body rotations towards the BVH reference rotations.
++        w_hand_prior: L2 prior on finger rotations.
++    """
++
++    num_betas: int = 16
++    num_frames: int = 8
++    iterations: int = 400
++    lr: float = 0.02
++    device: str = "cuda:0"
++    w_body: float = 1.0
++    w_hand: float = 1.0
++    w_hand_dir: float = 20.0
++    w_shape_prior: float = 0.5
++    w_shape_prior_extra: float = 3.0
++    w_pose_prior: float = 0.5
++    w_hand_prior: float = 0.05
++
++
++@dataclass(frozen=True)
++class ShapeFitResult:
++    """Fitted shape and diagnostics."""
++
++    betas: np.ndarray
++    body_error_cm: float
++    hand_error_cm: float
++    hand_error_cm_initial: float
++    hand_bone_ratio: np.ndarray  # (2, 20) SMPL-X / BVH bone length after fitting
++
++
++class _ShapeModel:
++    """SMPL-X joints plus fingertip vertices as a differentiable function of betas and pose."""
++
++    def __init__(self, model_path: Path, num_betas: int, tip_ids: list[int], device: torch.device) -> None:
++        with np.load(model_path, allow_pickle=True) as m:
++            v_template = np.asarray(m["v_template"], dtype=np.float32)
++            shapedirs = np.asarray(m["shapedirs"], dtype=np.float32)
++            posedirs = np.asarray(m["posedirs"], dtype=np.float32)
++            weights = np.asarray(m["weights"], dtype=np.float32)
++            regressor = m["J_regressor"]
++            if hasattr(regressor, "toarray"):
++                regressor = regressor.toarray()
++            parents = np.asarray(m["kintree_table"], dtype=np.int64)[0].copy()
++        parents[0] = -1
++        max_betas = shapedirs.shape[-1] - 100  # last 100 columns are expressions
++        if not 1 <= num_betas <= max_betas:
++            raise ValueError(f"num_betas must be in [1, {max_betas}]")
++        self.parents = parents
++        self.num_joints = len(parents)
++        self.tip_ids = torch.as_tensor(tip_ids, device=device)
++        self.v_template = torch.as_tensor(v_template, device=device)
++        self.shapedirs = torch.as_tensor(shapedirs[..., :num_betas].reshape(-1, num_betas), device=device)
++        self.regressor = torch.as_tensor(np.asarray(regressor, dtype=np.float32), device=device)
++        self.tip_posedirs = torch.as_tensor(posedirs[tip_ids].reshape(-1, posedirs.shape[-1]).T.copy(), device=device)
++        self.tip_weights = torch.as_tensor(weights[tip_ids], device=device)
++
++    def forward(self, betas: torch.Tensor, pose: torch.Tensor, trans: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        """Return posed joints ``(K, 55, 3)`` and fingertip vertices ``(K, 10, 3)``."""
++        k = pose.shape[0]
++        v_shaped = self.v_template + (self.shapedirs @ betas).reshape(-1, 3)
++        rest = self.regressor @ v_shaped  # (55, 3)
++        rel = rest.clone()
++        rel[1:] = rest[1:] - rest[self.parents[1:]]
++        rot = _rodrigues(pose)
++        rots = [rot[:, 0]]
++        pos = [rel[0].expand(k, 3)]
++        for j in range(1, self.num_joints):
++            p = self.parents[j]
++            rots.append(rots[p] @ rot[:, j])
++            pos.append(pos[p] + (rots[p] @ rel[j]))
++        g_rot = torch.stack(rots, 1)
++        joints = torch.stack(pos, 1)
++        skin_t = joints - (g_rot @ rest[None, :, :, None])[..., 0]
++        eye = torch.eye(3, device=pose.device)
++        feature = (rot[:, 1:] - eye).reshape(k, -1)
++        tips_rest = v_shaped[self.tip_ids][None] + (feature @ self.tip_posedirs).reshape(k, -1, 3)
++        blend = torch.matmul(self.tip_weights, torch.cat([g_rot.reshape(k, self.num_joints, 9), skin_t], -1))
++        tips = (blend[..., :9].reshape(k, -1, 3, 3) * tips_rest[..., None, :]).sum(-1) + blend[..., 9:]
++        return joints + trans[:, None], tips + trans[:, None]
++
++
++def fit_shape_and_hands(
++    source: MotionClip,
++    bvh_path: Path,
++    body_targets: np.ndarray,
++    reference_pose: np.ndarray,
++    neutral_rest_joints: np.ndarray,
++    model_path: Path,
++    config: ShapeFitConfig | None = None,
++    skeleton_map: str = "hiphi",
++) -> ShapeFitResult:
++    """Fit shape coefficients jointly with body and finger poses.
++
++    Args:
++        source: Parsed BVH clip.
++        bvh_path: BVH path (re-read for End Site fingertips).
++        body_targets: Mapped 22-joint targets ``(F, 22, 3)`` from ``prepare_body_inputs``.
++        reference_pose: Copied local body rotations ``(F, 22, 3)``.
++        neutral_rest_joints: Neutral 22 rest joints used for the foot correction.
++        model_path: SMPL-X NPZ.
++        config: Fitting settings.
++
++    Returns:
++        Fitted betas and error diagnostics.
++    """
++    cfg = ShapeFitConfig() if config is None else config
++    dev = torch.device(cfg.device)
++    if dev.type == "cuda" and not torch.cuda.is_available():
++        dev = torch.device("cpu")
++    num_frames = len(body_targets)
++    k = min(cfg.num_frames, num_frames)
++    frames = np.unique(np.linspace(0, num_frames - 1, k).round().astype(int))
++    k = len(frames)
++
++    targets = load_bvh_targets(bvh_path, clip=source, skeleton_map=skeleton_map)
++    layouts = {s: _hand_point_layout(s) for s in ("left", "right")}
++    tip_ids = layouts["left"][1] + layouts["right"][1]
++    model = _ShapeModel(model_path, cfg.num_betas, tip_ids, dev)
++
++    body_t = np.stack([_prepare_target_joints(body_targets[f], neutral_rest_joints) for f in frames])
++    body_t = torch.as_tensor(body_t, device=dev)
++    hand_t = {s: torch.as_tensor(targets.hands[s][frames], device=dev) for s in layouts}
++    hand_rows = {s: torch.as_tensor(layouts[s][0], device=dev) for s in layouts}
++    tip_cols = {"left": torch.arange(0, 5, device=dev), "right": torch.arange(5, 10, device=dev)}
++    bones = {s: torch.as_tensor(layouts[s][2], device=dev) for s in layouts}
++
++    betas = torch.zeros(cfg.num_betas, device=dev, requires_grad=True)
++    ref = torch.as_tensor(reference_pose[frames], device=dev)  # (k, 22, 3)
++    orient = ref[:, 0].clone().requires_grad_(True)
++    body = ref[:, 1:22].clone().requires_grad_(True)
++    hands = torch.zeros(k, 30, 3, device=dev, requires_grad=True)
++    with torch.no_grad():
++        j0, _ = model.forward(betas, _assemble(orient, body, hands), torch.zeros(k, 3, device=dev))
++    trans = (body_t[:, 0] - j0[:, 0]).clone().requires_grad_(True)
++
++    def hand_points(joints, tips, side):
++        return torch.cat([joints[:, hand_rows[side]], tips[:, tip_cols[side]]], 1)  # (k, 21, 3)
++
++    def hand_error(joints, tips):
++        errs = [((hand_points(joints, tips, s)[:, 1:] - hand_t[s][:, 1:]).norm(dim=-1)) for s in layouts]
++        return torch.cat(errs, 1).mean() * 100.0
++
++    with torch.no_grad():
++        j, t = model.forward(betas, _assemble(orient, body, hands), trans)
++        hand_err_init = float(hand_error(j, t))
++
++    opt = torch.optim.Adam([betas, orient, body, hands, trans], lr=cfg.lr)
++    for _ in range(cfg.iterations):
++        opt.zero_grad(set_to_none=True)
++        joints, tips = model.forward(betas, _assemble(orient, body, hands), trans)
++        loss = cfg.w_body * ((joints[:, :22] - body_t) * 100.0).pow(2).sum(-1).sum(-1).mean()
++        for s in layouts:
++            pts = hand_points(joints, tips, s)
++            tgt = hand_t[s]
++            b = bones[s]
++            loss = loss + cfg.w_hand * ((pts[:, 1:] - tgt[:, 1:]) * 100.0).pow(2).sum(-1).sum(-1).mean()
++            u_s = F.normalize(pts[:, b[:, 1]] - pts[:, b[:, 0]], dim=-1)
++            u_t = F.normalize(tgt[:, b[:, 1]] - tgt[:, b[:, 0]], dim=-1)
++            loss = loss + cfg.w_hand_dir * (u_s - u_t).pow(2).sum(-1).sum(-1).mean()
++        loss = loss + cfg.w_shape_prior * betas[:10].pow(2).sum() + cfg.w_shape_prior_extra * betas[10:].pow(2).sum()
++        loss = loss + cfg.w_pose_prior * ((body - ref[:, 1:22]).pow(2).sum() + (orient - ref[:, 0]).pow(2).sum()) / k
++        loss = loss + cfg.w_hand_prior * hands.pow(2).sum() / k
++        loss.backward()
++        opt.step()
++
++    with torch.no_grad():
++        joints, tips = model.forward(betas, _assemble(orient, body, hands), trans)
++        body_err = float((joints[:, :22] - body_t).norm(dim=-1).mean() * 100.0)
++        hand_err = float(hand_error(joints, tips))
++        ratios = []
++        for s in layouts:
++            pts = hand_points(joints, tips, s)
++            tgt = hand_t[s]
++            b = bones[s]
++            len_s = (pts[:, b[:, 1]] - pts[:, b[:, 0]]).norm(dim=-1).mean(0)
++            len_t = (tgt[:, b[:, 1]] - tgt[:, b[:, 0]]).norm(dim=-1).mean(0)
++            ratios.append((len_s / len_t).cpu().numpy())
++    return ShapeFitResult(
++        betas=betas.detach().cpu().numpy().astype(np.float32),
++        body_error_cm=body_err,
++        hand_error_cm=hand_err,
++        hand_error_cm_initial=hand_err_init,
++        hand_bone_ratio=np.stack(ratios),
++    )
++
++
++def _assemble(orient: torch.Tensor, body: torch.Tensor, hands: torch.Tensor) -> torch.Tensor:
++    k = orient.shape[0]
++    return torch.cat([orient[:, None], body, torch.zeros(k, 3, 3, device=orient.device), hands], 1)
+diff --git a/src/hiphi2smplx/skeleton.py b/src/hiphi2smplx/skeleton.py
+index ef0e8a4..46b34a1 100644
+--- a/src/hiphi2smplx/skeleton.py
++++ b/src/hiphi2smplx/skeleton.py
+@@ -105,7 +105,14 @@ SMPLX_BODY_PARENTS = np.asarray(
+ )
+ 
+ SMPLX_BODY_MAP = dict(zip(BODY_SEMANTICS, SMPLX_BODY_JOINT_NAMES, strict=True))
+-SOURCE_SKELETON_MAPS = {"hiphi": HIPHI_MAP}
++# Mixamo rig (e.g. HUMOTO GLB exported to BVH by humoto_bench/humoto_to_bvh.py): Spine / Spine1 / Spine2 only.
++MIXAMO_MAP = {
++    **HIPHI_MAP,
++    "spine2": "Spine1",
++    "chest": "Spine2",
++}
++
++SOURCE_SKELETON_MAPS = {"hiphi": HIPHI_MAP, "mixamo": MIXAMO_MAP}
+ 
+ 
+ @dataclass(frozen=True)

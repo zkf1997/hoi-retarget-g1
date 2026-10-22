@@ -1,0 +1,148 @@
+{
+  "file": "g1_wuji_hand2/g1_29dof_wuji_hand2.urdf",
+  "nq": 69,
+  "nv": 69,
+  "nbody": 102,
+  "ngeom": 177,
+  "body_joints": 29,
+  "hand_joints": 40,
+  "total_mass_kg": 34.385,
+  "hand_joint_names": [
+    "l_thumb_cmc_flex",
+    "l_thumb_cmc_abd",
+    "l_thumb_mcp",
+    "l_thumb_ip",
+    "l_index_finger_mcp_flex",
+    "l_index_finger_mcp_abd",
+    "l_index_finger_pip",
+    "l_index_finger_dip",
+    "l_middle_finger_mcp_flex",
+    "l_middle_finger_mcp_abd",
+    "l_middle_finger_pip",
+    "l_middle_finger_dip",
+    "l_ring_finger_mcp_flex",
+    "l_ring_finger_mcp_abd",
+    "l_ring_finger_pip",
+    "l_ring_finger_dip",
+    "l_pinky_mcp_flex",
+    "l_pinky_mcp_abd",
+    "l_pinky_pip",
+    "l_pinky_dip",
+    "r_thumb_cmc_flex",
+    "r_thumb_cmc_abd",
+    "r_thumb_mcp",
+    "r_thumb_ip",
+    "r_index_finger_mcp_flex",
+    "r_index_finger_mcp_abd",
+    "r_index_finger_pip",
+    "r_index_finger_dip",
+    "r_middle_finger_mcp_flex",
+    "r_middle_finger_mcp_abd",
+    "r_middle_finger_pip",
+    "r_middle_finger_dip",
+    "r_ring_finger_mcp_flex",
+    "r_ring_finger_mcp_abd",
+    "r_ring_finger_pip",
+    "r_ring_finger_dip",
+    "r_pinky_mcp_flex",
+    "r_pinky_mcp_abd",
+    "r_pinky_pip",
+    "r_pinky_dip"
+  ],
+  "tips_in_wrist_frame": {
+    "l_thumb_tip": [
+      0.1477,
+      -0.0196,
+      0.1092
+    ],
+    "l_index_finger_tip": [
+      0.2452,
+      0.007,
+      0.0406
+    ],
+    "l_middle_finger_tip": [
+      0.2502,
+      0.0128,
+      0.0028
+    ],
+    "l_ring_finger_tip": [
+      0.2406,
+      0.0072,
+      -0.0319
+    ],
+    "l_pinky_tip": [
+      0.2225,
+      -0.0008,
+      -0.0592
+    ],
+    "r_thumb_tip": [
+      0.1469,
+      0.0196,
+      0.1091
+    ],
+    "r_index_finger_tip": [
+      0.2452,
+      -0.007,
+      0.0406
+    ],
+    "r_middle_finger_tip": [
+      0.2502,
+      -0.0129,
+      0.0028
+    ],
+    "r_ring_finger_tip": [
+      0.2407,
+      -0.0073,
+      -0.0319
+    ],
+    "r_pinky_tip": [
+      0.2225,
+      -0.0013,
+      -0.0593
+    ]
+  },
+  "contacts_q0": [
+    [
+      "l_pinky_proximal_abd",
+      "l_wrist"
+    ],
+    [
+      "l_ring_finger_proximal_abd",
+      "l_wrist"
+    ],
+    [
+      "l_thumb_proximal_abd",
+      "l_wrist"
+    ],
+    [
+      "r_pinky_proximal_abd",
+      "r_wrist"
+    ],
+    [
+      "r_ring_finger_proximal_abd",
+      "r_wrist"
+    ]
+  ],
+  "contacts_hand_mid": [
+    [
+      "l_pinky_proximal_abd",
+      "l_wrist"
+    ],
+    [
+      "l_ring_finger_proximal_abd",
+      "l_wrist"
+    ],
+    [
+      "l_thumb_proximal_abd",
+      "l_wrist"
+    ],
+    [
+      "r_pinky_proximal_abd",
+      "r_wrist"
+    ],
+    [
+      "r_ring_finger_proximal_abd",
+      "r_wrist"
+    ]
+  ]
+}

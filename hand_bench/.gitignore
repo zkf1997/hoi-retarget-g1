@@ -1,0 +1,6 @@
+data/
+data_hiphi/
+results/
+results_hiphi/
+__pycache__/
+*.log

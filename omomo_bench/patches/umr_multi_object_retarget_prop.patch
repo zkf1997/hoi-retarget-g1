@@ -1,0 +1,217 @@
+diff --git a/scripts/retarget_smpl_to_humanoid_surface_vector.py b/scripts/retarget_smpl_to_humanoid_surface_vector.py
+index 95cce92..c752ddf 100644
+--- a/scripts/retarget_smpl_to_humanoid_surface_vector.py
++++ b/scripts/retarget_smpl_to_humanoid_surface_vector.py
+@@ -400,6 +400,7 @@ def fill_args_from_config(args):
+     set_default(args, "object_contact_map_snap_threshold", solver.get("object_contact_map_snap_threshold", 0.005))
+     set_default(args, "object_contact_map_max_points", solver.get("object_contact_map_max_points", 128))
+     set_default(args, "object_contact_map_samples", solver.get("object_contact_map_samples", 1024))
++    args.object_multi = bool(getattr(args, "object_multi", None) or solver.get("object_multi", False))  # load every <obj>.xml + prop_<obj>.csv of the sequence
+     set_default(args, "retarget_object_size", solver.get("retarget_object_size", "scaled"))
+     set_default(args, "robot_object_penetration_soft_cost", solver.get("robot_object_penetration_soft_cost", 0.0))
+     set_default(args, "robot_object_hard_constraint", solver.get("robot_object_hard_constraint", False))
+@@ -1206,8 +1207,12 @@ def load_object_contact_source(args, frame_ids, source_slots, smpl_scale, ground
+         args.robot_object_hard_constraint = False
+         args.robot_object_penetration_soft_cost = 0.0
+         return None
+-    if len(candidates) > 1:
++    use_multi = bool(getattr(args, "object_multi", False)) and len(candidates) > 1
++    if len(candidates) > 1 and not use_multi:
+         print(f"[HumanoidRetarget][ObjectContactMap][WARN] multiple objects found; using first: {candidates[0][0]}")
++    selected = candidates if use_multi else candidates[:1]
++    if use_multi:
++        print(f"[HumanoidRetarget][ObjectContactMap] multi-object: {[c[0] for c in selected]}")
+     object_name, object_path, prop_path = candidates[0]
+ 
+     hsi = section(args.config_data, "hsi_hoi")
+@@ -1226,39 +1231,55 @@ def load_object_contact_source(args, frame_ids, source_slots, smpl_scale, ground
+     retarget_mesh_scale = 1.0 if retarget_object_size == "original" else float(smpl_scale)
+     sample_count = int(args.object_contact_map_samples)
+     seed = int(args.seed)
+-    if object_path.suffix.lower() == ".xml":
+-        source_points_local = object_points_from_mjcf(object_path, sample_count, seed, source_mesh_scale)
+-        retarget_points_local = (
+-            source_points_local
+-            if abs(retarget_mesh_scale - source_mesh_scale) < 1e-12
+-            else object_points_from_mjcf(object_path, sample_count, seed, retarget_mesh_scale)
+-        )
+-    else:
+-        source_points_local = object_points_from_obj(
+-            object_path,
++    per_object = []  # (source_points_local, retarget_points_local, object_motion, robot_motion) per selected object
++    for object_name, object_path, prop_path in selected:
++        if object_path.suffix.lower() == ".xml":
++            source_points_local = object_points_from_mjcf(object_path, sample_count, seed, source_mesh_scale)
++            retarget_points_local = (
++                source_points_local
++                if abs(retarget_mesh_scale - source_mesh_scale) < 1e-12
++                else object_points_from_mjcf(object_path, sample_count, seed, retarget_mesh_scale)
++            )
++        else:
++            source_points_local = object_points_from_obj(
++                object_path,
++                output_up,
++                convert_y_up,
++                sample_count,
++                seed,
++                object_scale,
++                source_mesh_scale,
++            )
++            retarget_points_local = (
++                source_points_local
++                if abs(retarget_mesh_scale - source_mesh_scale) < 1e-12
++                else object_points_from_obj(object_path, output_up, convert_y_up, sample_count, seed, object_scale, retarget_mesh_scale)
++            )
++
++        object_motion = read_prop_motion(
++            prop_path,
++            frame_ids,
+             output_up,
+             convert_y_up,
+-            sample_count,
+-            seed,
+-            object_scale,
+-            source_mesh_scale,
+-        )
+-        retarget_points_local = (
+-            source_points_local
+-            if abs(retarget_mesh_scale - source_mesh_scale) < 1e-12
+-            else object_points_from_obj(object_path, output_up, convert_y_up, sample_count, seed, object_scale, retarget_mesh_scale)
++            ground_align,
++            floor_y,
++            ground_offset,
++            smpl_scale,
+         )
+-
+-    object_motion = read_prop_motion(
+-        prop_path,
+-        frame_ids,
+-        output_up,
+-        convert_y_up,
+-        ground_align,
+-        floor_y,
+-        ground_offset,
+-        smpl_scale,
+-    )
++        # Optional robot-side trajectory: ``retarget_prop_<obj>.csv`` next to the source csv (same format, pre-scaling units).
++        # Source contacts are still built along the original trajectory; the robot-side object points, penetration model and
++        # the saved object pose follow the retarget trajectory (used for the hand-anchored real-size-object variant).
++        retarget_prop_path = Path(prop_path).parent / f"retarget_{Path(prop_path).name}"
++        robot_motion = object_motion
++        if retarget_prop_path.exists():
++            robot_motion = read_prop_motion(retarget_prop_path, frame_ids, output_up, convert_y_up, ground_align, floor_y, ground_offset, smpl_scale)
++            print(f"[HumanoidRetarget][ObjectContactMap] retarget-side trajectory: {retarget_prop_path}")
++
++        per_object.append((source_points_local, retarget_points_local, object_motion, robot_motion))
++    object_name, object_path, prop_path = selected[0]
++    source_points_local = np.concatenate([o[0] for o in per_object], axis=0)
++    retarget_points_local = np.concatenate([o[1] for o in per_object], axis=0)
++    object_motion, robot_motion = per_object[0][2], per_object[0][3]
+     source_points_world = np.empty((len(frame_ids), len(source_points_local), 3), dtype=np.float32)
+     retarget_points_world = np.empty((len(frame_ids), len(retarget_points_local), 3), dtype=np.float32)
+     distances = np.empty((len(frame_ids), source_slots.shape[1]), dtype=np.float32)
+@@ -1267,10 +1288,13 @@ def load_object_contact_source(args, frame_ids, source_slots, smpl_scale, ground
+     snap_threshold = float(args.object_contact_map_snap_threshold)
+     snapped_count = 0
+     for frame_idx in range(len(frame_ids)):
+-        rot = np.asarray(object_motion["rot_mats"][frame_idx], dtype=np.float32)
+-        pos = np.asarray(object_motion["positions"][frame_idx], dtype=np.float32)
+-        source_obj_world = source_points_local @ rot.T + pos[None, :]
+-        retarget_obj_world = retarget_points_local @ rot.T + pos[None, :]
++        # all selected objects concatenated: the nearest-point query below then picks the nearest object per slot
++        source_obj_world = np.concatenate([
++            o[0] @ np.asarray(o[2]["rot_mats"][frame_idx], dtype=np.float32).T + np.asarray(o[2]["positions"][frame_idx], dtype=np.float32)[None, :]
++            for o in per_object], axis=0)
++        retarget_obj_world = np.concatenate([
++            o[1] @ np.asarray(o[3]["rot_mats"][frame_idx], dtype=np.float32).T + np.asarray(o[3]["positions"][frame_idx], dtype=np.float32)[None, :]
++            for o in per_object], axis=0)
+         source_points_world[frame_idx] = source_obj_world.astype(np.float32)
+         retarget_points_world[frame_idx] = retarget_obj_world.astype(np.float32)
+         dist, ids = cKDTree(source_obj_world).query(np.asarray(source_slots[frame_idx], dtype=np.float32), k=1)
+@@ -1314,8 +1338,12 @@ def load_object_contact_source(args, frame_ids, source_slots, smpl_scale, ground
+         "distances": distances,
+         "object_ids": object_ids,
+         "pair_vectors": pair_vectors,
+-        "motion_positions": object_motion["positions"].astype(np.float32),
+-        "motion_quats_wxyz": object_motion["quats_wxyz"].astype(np.float32),
++        "motion_positions": robot_motion["positions"].astype(np.float32),
++        "motion_quats_wxyz": robot_motion["quats_wxyz"].astype(np.float32),
++        "paths": [Path(c[1]) for c in selected],
++        # (F, K, 7) robot-side pose of every selected object (pos + quat wxyz), consumed by the penetration model
++        "object_poses_wxyz": np.stack([np.concatenate([o[3]["positions"], o[3]["quats_wxyz"]], axis=1) for o in per_object], axis=1).astype(np.float32),
++        "source_motion_positions": object_motion["positions"].astype(np.float32),
+     }
+ 
+ 
+@@ -1384,11 +1412,12 @@ def build_robot_object_penetration_cache(robot_xml: Path, object_source, main_mo
+ 
+     robot_root = ET.parse(robot_xml).getroot()
+     make_mjcf_mesh_paths_absolute(robot_root, robot_xml)
+-    append_object_mjcf_to_robot_root(
+-        robot_root,
+-        object_xml,
+-        object_mesh_scale=float(object_source.get("retarget_mesh_scale", 1.0)),
+-    )
++    for oxml in object_source.get("paths", [object_xml]):  # multi-object: one free body per object, qpos in the same order
++        append_object_mjcf_to_robot_root(
++            robot_root,
++            Path(oxml),
++            object_mesh_scale=float(object_source.get("retarget_mesh_scale", 1.0)),
++        )
+     # Keep the temporary MJCF beside the selected robot XML so relative MJCF
+     # includes (for example ``assets.xml``) retain their original base path.
+     with tempfile.NamedTemporaryFile(
+@@ -1460,6 +1489,7 @@ def build_robot_object_penetration_cache(robot_xml: Path, object_source, main_mo
+         "robot_nq": int(main_model.nq),
+         "robot_nv": int(main_model.nv),
+         "object_qadr": int(free_qpos_addrs[0]),
++        "object_qadrs": [int(a) for a in free_qpos_addrs],
+         "robot_geom_ids": robot_geom_ids,
+         "object_geom_ids": object_geom_ids.astype(np.int32),
+         "labels": common.geom_collision_labels(penetration_model),
+@@ -1473,12 +1503,13 @@ def compute_robot_object_penetration_rows(qpos, object_pose_wxyz, cache, margin,
+     penetration_data = cache["data"]
+     robot_nq = int(cache["robot_nq"])
+     robot_nv = int(cache["robot_nv"])
+-    object_qadr = int(cache["object_qadr"])
+-    object_pose_wxyz = np.asarray(object_pose_wxyz, dtype=np.float64).reshape(7)
++    object_qadrs = list(cache.get("object_qadrs", [int(cache["object_qadr"])]))
++    object_pose_wxyz = np.asarray(object_pose_wxyz, dtype=np.float64).reshape(-1, 7)  # (K, 7); K = 1 for a single object
+ 
+     mujoco.mj_resetData(penetration_model, penetration_data)
+     penetration_data.qpos[:robot_nq] = np.asarray(qpos, dtype=np.float64)[:robot_nq]
+-    penetration_data.qpos[object_qadr : object_qadr + 7] = object_pose_wxyz
++    for object_qadr, pose in zip(object_qadrs, object_pose_wxyz):
++        penetration_data.qpos[object_qadr : object_qadr + 7] = pose
+     mujoco.mj_forward(penetration_model, penetration_data)
+ 
+     activation_distance = max(float(threshold), float(margin), 0.0)
+@@ -1916,11 +1947,15 @@ def solve_frame_body_segment_qp(
+             and object_contact_frame is not None
+             and robot_object_penetration_cache is not None
+         ):
+-            object_pose = np.concatenate(
+-                [
+-                    np.asarray(object_contact_frame["object_position"], dtype=np.float64).reshape(3),
+-                    np.asarray(object_contact_frame["object_quat_wxyz"], dtype=np.float64).reshape(4),
+-                ]
++            object_pose = (
++                np.asarray(object_contact_frame["object_poses"], dtype=np.float64)
++                if object_contact_frame.get("object_poses") is not None
++                else np.concatenate(
++                    [
++                        np.asarray(object_contact_frame["object_position"], dtype=np.float64).reshape(3),
++                        np.asarray(object_contact_frame["object_quat_wxyz"], dtype=np.float64).reshape(4),
++                    ]
++                )
+             )
+             robot_object_margin = float(args.robot_object_margin)
+             jacobians_object, distances_object = compute_robot_object_penetration_rows(
+@@ -2667,6 +2702,7 @@ def main():
+                     "object_points": object_contact_source["retarget_points_world"][out_idx],
+                     "object_position": object_contact_source["motion_positions"][out_idx],
+                     "object_quat_wxyz": object_contact_source["motion_quats_wxyz"][out_idx],
++                    "object_poses": (object_contact_source["object_poses_wxyz"][out_idx] if "object_poses_wxyz" in object_contact_source else None),
+                 }
+             q_opt, cost = solve_frame_body_segment_qp(
+                 model,

@@ -1,0 +1,24 @@
+{
+  "_doc": [
+    "Fixed hand joint values used whenever a G1 URDF with hands is displayed (retargeting only produces the 29 body DoF).",
+    "Rules are applied in order; the last matching fnmatch pattern wins; unmatched hand joints get `default`.",
+    "Values are radians. Zero = fully open for both hands; the defaults below give a slightly curled, relaxed hand."
+  ],
+  "default": 0.0,
+  "rules": [
+    {"match": "*_thumb_metacarpal_joint", "value": 0.30, "note": "BrainCo Revo2: thumb swing across the palm (0..1.55)"},
+    {"match": "*_thumb_proximal_joint",   "value": 0.20, "note": "BrainCo Revo2 (0..1.05)"},
+    {"match": "*_thumb_distal_joint",     "value": 0.20, "note": "BrainCo Revo2, linkage-driven 1.0x on hardware"},
+    {"match": "*_proximal_joint",         "value": 0.35, "note": "BrainCo Revo2 finger MCP (0..1.41)"},
+    {"match": "*_distal_joint",           "value": 0.40, "note": "BrainCo Revo2 finger PIP, 1.155x proximal on hardware"},
+
+    {"match": "?_thumb_cmc_flex",         "value": 0.20, "note": "Wuji Hand 2 (-1.19..1.29)"},
+    {"match": "?_thumb_cmc_abd",          "value": 0.00, "note": "Wuji Hand 2 (-1.48..0.70)"},
+    {"match": "?_thumb_mcp",              "value": 0.20, "note": "Wuji Hand 2 (-1.05..1.57)"},
+    {"match": "?_thumb_ip",               "value": 0.20},
+    {"match": "?_*_mcp_flex",             "value": 0.30, "note": "Wuji Hand 2 finger MCP flexion (-1.05..1.57)"},
+    {"match": "?_*_mcp_abd",              "value": 0.00, "note": "Wuji Hand 2 finger abduction (-0.70..0.70)"},
+    {"match": "?_*_pip",                  "value": 0.40, "note": "Wuji Hand 2 (-1.05..2.09)"},
+    {"match": "?_*_dip",                  "value": 0.20}
+  ]
+}

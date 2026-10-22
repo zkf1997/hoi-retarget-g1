@@ -1,0 +1,40 @@
+# @package _global_
+# SPIDER override: G1 + Wuji Hand 2 (69 DoF) + one HiPHI object (scenes built by omomo_bench/spider_bridge/build_hiphi.py).
+# Copy / symlink into spider/examples/config/override/ and run with +override=g1_wuji_hiphi task=<tag>.
+dataset_dir: /home/kaizhao/projects/retarget/omomo_bench/spider_bridge/data
+dataset_name: hiphi
+robot_type: g1_wuji
+embodiment_type: humanoid_object
+data_id: 0
+viewer: none
+show_viewer: false
+wait_on_finish: false
+save_video: true
+sanity_check_seconds: 0.0
+sim_dt: 0.01
+ref_dt: 0.02
+render_dt: 0.02
+trace_dt: 0.02
+max_sim_steps: -1
+horizon: 0.8
+ctrl_dt: 0.1
+knot_dt: 0.1
+nconmax_per_env: 200
+njmax_per_env: 800
+# annealing / sampling (SPIDER humanoid_object defaults)
+first_ctrl_noise_scale: 0.5
+last_ctrl_noise_scale: 1.0
+final_noise_scale: 0.1
+joint_noise_scale: 0.1
+improvement_threshold: 0.01
+max_num_iterations: 16
+temperature: 1.0
+num_samples: 1024
+# reward
+vel_rew_scale: 0.0
+joint_rew_scale: 1.0
+base_pos_rew_scale: 1.0
+base_rot_rew_scale: 1.0
+pos_rew_scale: 1.0
+rot_rew_scale: 0.3
+contact_rew_scale: 0.0

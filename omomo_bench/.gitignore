@@ -1,0 +1,10 @@
+data/
+results/
+omni_workdir/
+configs/generated/
+__pycache__/
+robots/*.floating_mjcf.xml
+# per-dataset variants (BENCH_DATASET=humoto|hiphi): converted data, results, holosoma work dirs
+data_*/
+results_*/
+omni_workdir_*/

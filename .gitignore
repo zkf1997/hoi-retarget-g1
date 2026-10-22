@@ -1,0 +1,14 @@
+urdf/third_party/
+__pycache__/
+*.pyc
+third_party/
+hand_bench/data/
+hand_bench/results/
+hand_bench/__pycache__/
+logs/
+wbt_logs/
+omomo_bench/wbt/data/
+omomo_bench/wbt/assets/objects/
+omomo_bench/wbt/assets/robot/converted_rank0/
+omomo_bench/wbt/assets/robot/*_nohandcol.urdf
+omomo_bench/spider_bridge/data/

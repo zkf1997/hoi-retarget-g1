@@ -1,0 +1,6 @@
+[submodule "holosoma"]
+	path = holosoma
+	url = https://github.com/amazon-far/holosoma.git
+[submodule "UMR"]
+	path = UMR
+	url = https://github.com/hanyang9/UMR.git
